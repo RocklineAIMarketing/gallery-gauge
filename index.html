@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Gallery Gauge — find your next museum or park</title>
+<meta name="description" content="Search and rate museums, national parks, and monuments across the US." />
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap"
+  rel="stylesheet"
+/>
+
+<!-- Supabase client, loaded from CDN -- this is the whole "backend" for auth + reviews -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+<style>
+  :root {
+    --navy: #29455D;
+    --navy-dark: #1D3345;
+    --gold: #D29D43;
+    --gold-dark: #AC7E30;
+    --taupe: #948777;
+    --cream: #FBF7F3;
+    --stone: #F0E9DE;
+    --line: #E1D8C8;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--cream);
+    color: var(--navy);
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  h1, h2, h3, .serif { font-family: 'Fraunces', serif; }
+
+  .site-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 20px 48px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .site-header nav { display: flex; gap: 32px; font-size: 15px; }
+  .site-header nav a { color: var(--navy); text-decoration: none; }
+  .site-header nav a:hover { color: var(--gold-dark); }
+
+  .auth-area { display: flex; align-items: center; gap: 12px; font-size: 14px; }
+
+  .signin, .btn {
+    border: 1px solid var(--navy);
+    padding: 8px 18px;
+    border-radius: 3px;
+    font-size: 14px;
+    text-decoration: none;
+    color: var(--navy);
+    background: transparent;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .signin:hover, .btn:hover { background: var(--navy); color: var(--cream); }
+  .btn-primary { background: var(--gold); border-color: var(--gold); color: #fff; }
+  .btn-primary:hover { background: var(--gold-dark); border-color: var(--gold-dark); color: #fff; }
+
+  .username-pill {
+    border: 1px solid var(--line);
+    padding: 6px 14px;
+    border-radius: 20px;
+    cursor: pointer;
+    background: #fff;
+  }
+
+  main {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 40px 24px 96px;
+  }
+
+  .hero { text-align: center; margin-bottom: 36px; }
+
+  h1 {
+    font-size: 40px;
+    font-weight: 500;
+    line-height: 1.2;
+    margin: 0 auto 12px;
+    max-width: 680px;
+    color: var(--navy-dark);
+  }
+
+  .sub { color: var(--taupe); font-size: 16px; margin: 0 0 36px; }
+
+  .search-panel {
+    display: flex;
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 6px;
+    box-shadow: 0 1px 2px rgba(41, 69, 93, 0.06);
+    max-width: 780px;
+    margin: 0 auto;
+  }
+
+  .search-field { flex: 2; display: flex; flex-direction: column; padding: 10px 16px; border-right: 1px solid var(--line); text-align: left; }
+  .search-field:last-of-type { border-right: none; flex: 1.3; }
+  .search-field label { font-size: 11px; color: var(--taupe); margin-bottom: 2px; }
+  .search-field input { border: none; outline: none; font-family: inherit; font-size: 15px; width: 100%; background: transparent; color: var(--navy-dark); }
+  .search-field input::placeholder { color: #B7AC9C; }
+
+  .go {
+    background: var(--gold); color: #fff; border: none; border-radius: 4px;
+    padding: 0 28px; font-family: inherit; font-size: 15px; font-weight: 500; cursor: pointer;
+  }
+  .go:hover { background: var(--gold-dark); }
+
+  .status-line { text-align: center; color: var(--taupe); font-size: 14px; margin: 20px 0; }
+
+  .near-header {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 24px; border-bottom: 1px solid var(--line); padding-bottom: 16px;
+  }
+  .near-header h2 { font-size: 22px; font-weight: 500; margin: 0; color: var(--navy-dark); }
+  .near-header span { font-size: 13px; color: var(--taupe); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 24px; }
+
+  .card {
+    background: #fff; border: 1px solid var(--line); border-radius: 6px; padding: 16px;
+    cursor: pointer; text-align: left; transition: border-color .15s;
+  }
+  .card:hover { border-color: var(--gold); }
+
+  .card-photo {
+    height: 130px; background: var(--stone); border-radius: 3px; margin-bottom: 14px;
+    display: flex; align-items: center; justify-content: center; color: var(--taupe);
+    font-size: 12px; overflow: hidden;
+  }
+  .card-photo img { width: 100%; height: 100%; object-fit: cover; }
+
+  .card-tag { font-size: 11px; color: var(--gold-dark); margin-bottom: 6px; display: block; }
+  .card h3 { font-size: 17px; font-weight: 500; margin: 0 0 8px; color: var(--navy-dark); }
+
+  .score { display: inline-flex; align-items: baseline; gap: 4px; font-family: 'Fraunces', serif; font-size: 15px; font-weight: 600; color: var(--navy-dark); }
+  .score span { font-family: 'Inter', sans-serif; font-size: 11px; font-weight: 400; color: var(--taupe); }
+  .score.mine { color: var(--gold-dark); }
+
+  /* Modal (shared for sign-in, username setup, and check-in) */
+  .overlay {
+    display: none; position: fixed; inset: 0; background: rgba(29, 51, 69, 0.45);
+    align-items: center; justify-content: center; z-index: 50; padding: 20px;
+  }
+  .overlay.open { display: flex; }
+  .modal {
+    background: #fff; border-radius: 8px; padding: 28px; width: 100%; max-width: 400px;
+    text-align: left;
+  }
+  .modal h3 { margin: 0 0 6px; color: var(--navy-dark); }
+  .modal p { color: var(--taupe); font-size: 14px; margin: 0 0 18px; }
+  .modal input[type="email"], .modal input[type="text"] {
+    width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 4px;
+    font-family: inherit; font-size: 14px; margin-bottom: 14px;
+  }
+  .modal input[type="range"] { width: 100%; margin: 14px 0; }
+  .modal-score { text-align: center; font-family: 'Fraunces', serif; font-size: 40px; color: var(--navy-dark); }
+  .modal-actions { display: flex; gap: 10px; margin-top: 6px; }
+  .modal-actions .btn, .modal-actions .btn-primary { flex: 1; }
+  .modal-close { float: right; background: none; border: none; color: var(--taupe); cursor: pointer; font-size: 18px; }
+
+  .site-footer {
+    border-top: 1px solid var(--line); padding: 32px 48px; display: flex;
+    justify-content: space-between; font-size: 13px; color: var(--taupe);
+  }
+
+  @media (max-width: 640px) {
+    .site-header { padding: 16px 20px; }
+    .site-header nav { display: none; }
+    h1 { font-size: 28px; }
+    .search-panel { flex-direction: column; }
+    .search-field { border-right: none; border-bottom: 1px solid var(--line); }
+    .search-field:last-of-type { border-bottom: none; }
+    .go { margin: 10px 6px 4px; padding: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="site-header">
+  <span class="serif" style="font-size:20px;font-weight:600;color:var(--navy-dark);">Gallery Gauge</span>
+  <div class="auth-area" id="authArea">
+    <!-- Filled in by JS: either a "Sign in" button, or username pill + sign out -->
+  </div>
+</header>
+
+<main>
+  <div class="hero">
+    <h1>Find a museum or park worth the trip</h1>
+    <p class="sub">Search by place or name. Rated by people who've actually gone.</p>
+
+    <form class="search-panel" id="searchForm">
+      <div class="search-field">
+        <label for="q">What are you looking for</label>
+        <input id="q" name="q" type="text" placeholder="Art museums, national monuments, dinosaur exhibits..." />
+      </div>
+      <div class="search-field">
+        <label for="location">City, state, or zip</label>
+        <input id="location" name="location" type="text" placeholder="Chicago, IL" />
+      </div>
+      <button type="submit" class="go">Search</button>
+    </form>
+  </div>
+
+  <p class="status-line" id="statusLine"></p>
+
+  <div class="near-header" id="resultsHeader" style="display:none;">
+    <h2 id="resultsTitle">Results</h2>
+    <span id="resultsCount"></span>
+  </div>
+
+  <div class="grid" id="resultsGrid"></div>
+</main>
+
+<footer class="site-footer">
+  <span>Gallery Gauge</span>
+  <span>Museum reviews. Real insight.</span>
+</footer>
+
+<!-- Sign-in modal -->
+<div class="overlay" id="signInOverlay">
+  <div class="modal">
+    <button class="modal-close" id="closeSignIn">&times;</button>
+    <h3>Sign in</h3>
+    <p>We'll email you a magic link — no password needed.</p>
+    <input type="email" id="signInEmail" placeholder="you@example.com" />
+    <div class="modal-actions">
+      <button class="btn btn-primary" id="sendMagicLink" style="width:100%;">Send link</button>
+    </div>
+    <p id="signInStatus" style="margin-top:12px;font-size:13px;"></p>
+  </div>
+</div>
+
+<!-- Username setup modal -->
+<div class="overlay" id="usernameOverlay">
+  <div class="modal">
+    <h3>Choose a username</h3>
+    <p>This is how other people will find and follow you.</p>
+    <input type="text" id="usernameInput" placeholder="e.g. rickm" />
+    <div class="modal-actions">
+      <button class="btn btn-primary" id="saveUsername" style="width:100%;">Continue</button>
+    </div>
+    <p id="usernameStatus" style="margin-top:8px;font-size:13px;color:var(--taupe);"></p>
+  </div>
+</div>
+
+<!-- Check-in modal -->
+<div class="overlay" id="checkinOverlay">
+  <div class="modal">
+    <button class="modal-close" id="closeCheckin">&times;</button>
+    <h3 id="checkinPlaceName">Rate this place</h3>
+    <p>Slide to set your gauge score.</p>
+    <div class="modal-score" id="checkinScoreDisplay">75</div>
+    <input type="range" min="0" max="100" value="75" id="checkinSlider" />
+    <div class="modal-actions">
+      <button class="btn-primary btn" id="saveCheckin">Save</button>
+    </div>
+    <p id="checkinStatus" style="margin-top:8px;font-size:13px;color:var(--taupe);"></p>
+  </div>
+</div>
+
+<script>
+/* ---------------------------------------------------------------------
+   CONFIG — fill these in
+--------------------------------------------------------------------- */
+const SUPABASE_URL = "https://agzfkecmmczwxuazrtsh.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFnemZrZWNtbWN6d3h1YXpydHNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg2MDkwNDMsImV4cCI6MjEwNDE4NTA0M30.4OHP53uWqVri6pQrBS8fsKu0D9nqWMv6iFROEfwSgs8";
+const NPS_API_KEY = "yg2ocJ2tqasOg20BMwPoTf3DxQg8zNyxn0tcrUOy";
+
+/* ---------------------------------------------------------------------
+   NOTE ON SCHEMA ASSUMPTIONS
+   This assumes your `reviews` table has columns:
+     user_id (uuid), place_id (text), place_name (text), score (int),
+     with a unique constraint on (user_id, place_id) -- matching what
+     you already set up. And `profiles` has: id (uuid), username (text),
+     is_public (bool). If your real column names differ, search for
+     "reviews" and "profiles" below and adjust field names to match.
+--------------------------------------------------------------------- */
+
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+let currentUser = null;
+let currentProfile = null;
+let lastResults = []; // the merged venue list from the last search
+
+/* ---------------------------------------------------------------------
+   AUTH
+--------------------------------------------------------------------- */
+async function refreshAuthUI() {
+  const { data: { session } } = await supabase.auth.getSession();
+  currentUser = session?.user ?? null;
+  const authArea = document.getElementById("authArea");
+
+  if (!currentUser) {
+    authArea.innerHTML = `<button class="signin" id="openSignIn">Sign in</button>`;
+    document.getElementById("openSignIn").onclick = () => toggleOverlay("signInOverlay", true);
+    currentProfile = null;
+    return;
+  }
+
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("username, is_public")
+    .eq("id", currentUser.id)
+    .maybeSingle();
+
+  currentProfile = profile;
+
+  if (!profile?.username) {
+    toggleOverlay("usernameOverlay", true);
+    authArea.innerHTML = `<button class="btn" id="signOutBtn">Sign out</button>`;
+  } else {
+    authArea.innerHTML = `
+      <span class="username-pill">@${profile.username}</span>
+      <button class="btn" id="signOutBtn">Sign out</button>
+    `;
+  }
+  document.getElementById("signOutBtn").onclick = async () => {
+    await supabase.auth.signOut();
+    refreshAuthUI();
+  };
+}
+
+document.getElementById("closeSignIn").onclick = () => toggleOverlay("signInOverlay", false);
+
+document.getElementById("sendMagicLink").onclick = async () => {
+  const email = document.getElementById("signInEmail").value.trim();
+  const statusEl = document.getElementById("signInStatus");
+  if (!email) { statusEl.textContent = "Enter an email first."; return; }
+  statusEl.textContent = "Sending...";
+  const { error } = await supabase.auth.signInWithOtp({ email });
+  statusEl.textContent = error ? `Error: ${error.message}` : "Check your email for the link.";
+};
+
+document.getElementById("saveUsername").onclick = async () => {
+  const username = document.getElementById("usernameInput").value.trim();
+  const statusEl = document.getElementById("usernameStatus");
+  if (!username) { statusEl.textContent = "Username can't be empty."; return; }
+  const { error } = await supabase
+    .from("profiles")
+    .upsert({ id: currentUser.id, username, is_public: true }, { onConflict: "id" });
+  if (error) { statusEl.textContent = `Error: ${error.message}`; return; }
+  toggleOverlay("usernameOverlay", false);
+  refreshAuthUI();
+};
+
+supabase.auth.onAuthStateChange(() => refreshAuthUI());
+
+function toggleOverlay(id, open) {
+  document.getElementById(id).classList.toggle("open", open);
+}
+
+/* ---------------------------------------------------------------------
+   GEOCODING -- Nominatim (OpenStreetMap), free + CORS-friendly for light use
+--------------------------------------------------------------------- */
+async function geocodeLocation(query) {
+  if (!query) return null;
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const data = await res.json();
+  if (!data.length) return null;
+  return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+}
+
+/* ---------------------------------------------------------------------
+   VENUE SOURCES -- live calls, no database of our own
+--------------------------------------------------------------------- */
+async function searchNPS(q) {
+  const url = `https://developer.nps.gov/api/v1/parks?q=${encodeURIComponent(q || "")}&limit=20&api_key=${NPS_API_KEY}`;
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const json = await res.json();
+  return (json.data || [])
+    .filter(p => p.latitude && p.longitude)
+    .map(p => ({
+      id: `nps:${p.parkCode}`,
+      name: p.fullName,
+      category: /monument|historic/i.test(p.designation || "") ? "National monument" : "National park",
+      city: p.addresses?.[0]?.city || "",
+      state: p.states?.split(",")[0] || "",
+      lat: parseFloat(p.latitude),
+      lng: parseFloat(p.longitude),
+      description: p.description,
+      photo_url: p.images?.[0]?.url || null,
+    }));
+}
+
+async function searchOverpass(center, radiusMiles = 25) {
+  if (!center) return [];
+  const radiusMeters = Math.round(radiusMiles * 1609.34);
+  const query = `
+    [out:json][timeout:25];
+    (
+      node["tourism"="museum"](around:${radiusMeters},${center.lat},${center.lng});
+      node["tourism"="gallery"](around:${radiusMeters},${center.lat},${center.lng});
+      node["historic"="monument"](around:${radiusMeters},${center.lat},${center.lng});
+    );
+    out body 30;
+  `;
+  const res = await fetch("https://overpass-api.de/api/interpreter", {
+    method: "POST",
+    body: new URLSearchParams({ data: query }),
+  });
+  if (!res.ok) return [];
+  const json = await res.json();
+  return (json.elements || [])
+    .filter(el => el.tags?.name)
+    .map(el => ({
+      id: `osm:${el.type}/${el.id}`,
+      name: el.tags.name,
+      category: el.tags.tourism === "gallery" ? "Gallery" : (el.tags.historic ? "Monument" : "Museum"),
+      city: el.tags["addr:city"] || "",
+      state: el.tags["addr:state"] || "",
+      lat: el.lat,
+      lng: el.lon,
+      description: null,
+      photo_url: null,
+    }));
+}
+
+/* ---------------------------------------------------------------------
+   REVIEWS -- pull scores from Supabase for whatever venues came back
+--------------------------------------------------------------------- */
+async function attachScores(venues) {
+  if (!venues.length) return venues;
+  const ids = venues.map(v => v.id);
+  const { data: rows, error } = await supabase
+    .from("reviews")
+    .select("place_id, score, user_id")
+    .in("place_id", ids);
+
+  if (error) {
+    console.error("Couldn't load reviews:", error.message);
+    return venues;
+  }
+
+  const byPlace = {};
+  for (const row of rows) {
+    (byPlace[row.place_id] ||= []).push(row);
+  }
+
+  return venues.map(v => {
+    const placeReviews = byPlace[v.id] || [];
+    const avg = placeReviews.length
+      ? placeReviews.reduce((s, r) => s + r.score, 0) / placeReviews.length
+      : null;
+    const mine = currentUser
+      ? placeReviews.find(r => r.user_id === currentUser.id)?.score ?? null
+      : null;
+    return { ...v, avgScore: avg, reviewCount: placeReviews.length, myScore: mine };
+  });
+}
+
+/* ---------------------------------------------------------------------
+   SEARCH FLOW
+--------------------------------------------------------------------- */
+document.getElementById("searchForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const q = document.getElementById("q").value.trim();
+  const location = document.getElementById("location").value.trim();
+  const statusLine = document.getElementById("statusLine");
+  const grid = document.getElementById("resultsGrid");
+  const header = document.getElementById("resultsHeader");
+
+  statusLine.textContent = "Searching...";
+  grid.innerHTML = "";
+  header.style.display = "none";
+
+  const center = location ? await geocodeLocation(location) : null;
+  if (location && !center) {
+    statusLine.textContent = "Couldn't find that location -- showing nationwide NPS results instead.";
+  }
+
+  const [npsResults, osmResults] = await Promise.all([
+    searchNPS(q),
+    searchOverpass(center),
+  ]);
+
+  let merged = [...npsResults, ...osmResults];
+  if (q) {
+    const qLower = q.toLowerCase();
+    merged = merged.filter(v =>
+      v.name.toLowerCase().includes(qLower) ||
+      v.category.toLowerCase().includes(qLower) ||
+      (v.description || "").toLowerCase().includes(qLower)
+    );
+  }
+
+  merged = await attachScores(merged);
+  lastResults = merged;
+
+  if (!location) statusLine.textContent = "";
+  else if (center) statusLine.textContent = "";
+
+  header.style.display = "flex";
+  document.getElementById("resultsTitle").textContent = q ? `Results for "${q}"` : "All venues";
+  document.getElementById("resultsCount").textContent = `${merged.length} found`;
+
+  if (!merged.length) {
+    grid.innerHTML = `<p style="grid-column:1/-1;text-align:center;color:var(--taupe);padding:40px 0;">Nothing matched. Try a broader term or a different location.</p>`;
+    return;
+  }
+
+  grid.innerHTML = merged.map(renderCard).join("");
+  merged.forEach(v => {
+    document.getElementById(`card-${cssSafe(v.id)}`).onclick = () => openCheckin(v);
+  });
+});
+
+function cssSafe(id) { return id.replace(/[^a-zA-Z0-9]/g, "_"); }
+
+function renderCard(v) {
+  const scoreHtml = v.avgScore != null
+    ? `<span class="score">${Math.round(v.avgScore)}<span> / 100 · ${v.reviewCount} rating${v.reviewCount === 1 ? "" : "s"}</span></span>`
+    : `<span class="score" style="color:var(--taupe);">Not yet rated</span>`;
+  const mineHtml = v.myScore != null
+    ? `<div class="score mine" style="margin-top:6px;">Your gauge: ${v.myScore}</div>` : "";
+
+  return `
+    <div class="card" id="card-${cssSafe(v.id)}">
+      <div class="card-photo">${v.photo_url ? `<img src="${v.photo_url}" alt="" />` : "Photo"}</div>
+      <span class="card-tag">${v.category}${v.city ? ` · ${v.city}, ${v.state}` : ""}</span>
+      <h3>${v.name}</h3>
+      ${scoreHtml}
+      ${mineHtml}
+    </div>
+  `;
+}
+
+/* ---------------------------------------------------------------------
+   CHECK-IN FLOW
+--------------------------------------------------------------------- */
+let checkinTarget = null;
+
+function openCheckin(venue) {
+  if (!currentUser) { toggleOverlay("signInOverlay", true); return; }
+  checkinTarget = venue;
+  document.getElementById("checkinPlaceName").textContent = venue.name;
+  const initial = venue.myScore ?? 75;
+  document.getElementById("checkinSlider").value = initial;
+  document.getElementById("checkinScoreDisplay").textContent = initial;
+  document.getElementById("checkinStatus").textContent = "";
+  toggleOverlay("checkinOverlay", true);
+}
+
+document.getElementById("checkinSlider").addEventListener("input", (e) => {
+  document.getElementById("checkinScoreDisplay").textContent = e.target.value;
+});
+
+document.getElementById("closeCheckin").onclick = () => toggleOverlay("checkinOverlay", false);
+
+document.getElementById("saveCheckin").onclick = async () => {
+  const score = parseInt(document.getElementById("checkinSlider").value, 10);
+  const statusEl = document.getElementById("checkinStatus");
+  statusEl.textContent = "Saving...";
+
+  const { error } = await supabase
+    .from("reviews")
+    .upsert(
+      { user_id: currentUser.id, place_id: checkinTarget.id, place_name: checkinTarget.name, score },
+      { onConflict: "user_id,place_id" }
+    );
+
+  if (error) { statusEl.textContent = `Error: ${error.message}`; return; }
+  toggleOverlay("checkinOverlay", false);
+
+  // Reflect the new score immediately without a full re-search
+  const idx = lastResults.findIndex(v => v.id === checkinTarget.id);
+  if (idx !== -1) {
+    lastResults[idx].myScore = score;
+    document.getElementById("resultsGrid").innerHTML = lastResults.map(renderCard).join("");
+    lastResults.forEach(v => {
+      document.getElementById(`card-${cssSafe(v.id)}`).onclick = () => openCheckin(v);
+    });
+  }
+};
+
+/* ---------------------------------------------------------------------
+   INIT
+--------------------------------------------------------------------- */
+refreshAuthUI();
+</script>
+
+</body>
+</html>
