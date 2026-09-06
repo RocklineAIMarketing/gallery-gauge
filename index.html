@@ -84,6 +84,18 @@
 
   .hero { text-align: center; margin-bottom: 36px; }
 
+  .hero-wrap {
+    max-width: 320px;
+    margin: 0 auto 24px;
+  }
+
+  .hero-photo {
+    width: 100%;
+    height: auto;
+    display: block;
+    object-fit: contain; /* keeps the whole image visible, never cropped */
+  }
+
   h1 {
     font-size: 40px;
     font-weight: 500;
@@ -198,6 +210,9 @@
 
 <main>
   <div class="hero">
+    <div class="hero-wrap">
+      <img class="hero-photo" src="images/gallery-gauge-logo.png" alt="Gallery Gauge" />
+    </div>
     <h1>Find a museum or park worth the trip</h1>
     <p class="sub">Search by place or name. Rated by people who've actually gone.</p>
 
@@ -288,6 +303,19 @@ const NPS_API_KEY = "yg2ocJ2tqasOg20BMwPoTf3DxQg8zNyxn0tcrUOy";
      is_public (bool). If your real column names differ, search for
      "reviews" and "profiles" below and adjust field names to match.
 --------------------------------------------------------------------- */
+
+// Surface any JS error on-page instead of failing totally silently
+window.addEventListener("error", (e) => {
+  const el = document.getElementById("statusLine");
+  if (el) el.textContent = "Script error: " + e.message + " (see browser console for details)";
+  console.error(e.error || e.message);
+});
+
+if (!window.supabase) {
+  document.getElementById("statusLine").textContent =
+    "Couldn't load the Supabase library from the CDN -- check your internet connection or ad blocker, then reload.";
+  throw new Error("Supabase CDN script did not load");
+}
 
 const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
@@ -469,9 +497,10 @@ async function attachScores(venues) {
 --------------------------------------------------------------------- */
 document.getElementById("searchForm").addEventListener("submit", async (e) => {
   e.preventDefault();
+  const statusLine = document.getElementById("statusLine");
+  try {
   const q = document.getElementById("q").value.trim();
   const location = document.getElementById("location").value.trim();
-  const statusLine = document.getElementById("statusLine");
   const grid = document.getElementById("resultsGrid");
   const header = document.getElementById("resultsHeader");
 
@@ -518,6 +547,10 @@ document.getElementById("searchForm").addEventListener("submit", async (e) => {
   merged.forEach(v => {
     document.getElementById(`card-${cssSafe(v.id)}`).onclick = () => openCheckin(v);
   });
+  } catch (err) {
+    console.error(err);
+    statusLine.textContent = "Search failed: " + err.message + " (see browser console for details)";
+  }
 });
 
 function cssSafe(id) { return id.replace(/[^a-zA-Z0-9]/g, "_"); }
