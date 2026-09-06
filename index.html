@@ -299,7 +299,7 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 // their JS/browser tier), but you should still add your site's domain to
 // the key's allowed referrers in the Geoapify dashboard to stop other sites
 // from burning your quota. Get/manage it at https://myprojects.geoapify.com/
-const GEOAPIFY_API_KEY = "12f31292adff4eeb848538ddecf51b8a";
+const GEOAPIFY_API_KEY = "YOUR_GEOAPIFY_API_KEY";
 
 /* ---------------------------------------------------------------------
    SCHEMA THIS PAGE EXPECTS (matches the SQL you ran in Supabase):
@@ -338,10 +338,13 @@ let lastResults = []; // the merged venue list from the last search
 const locationCache = new Map();
 const CACHE_TTL_MS = 10 * 60 * 1000;
 
-function cacheKeyFor(center) {
-  if (!center) return "nationwide";
-  // round to ~1km so tiny geocoding jitter still hits the cache
-  return `${center.lat.toFixed(2)},${center.lng.toFixed(2)}`;
+function cacheKeyFor(center, words) {
+  if (center) {
+    // round to ~1km so tiny geocoding jitter still hits the cache
+    return `${center.lat.toFixed(2)},${center.lng.toFixed(2)}`;
+  }
+  if (words && words.length) return `nationwide-q:${words.join(" ")}`;
+  return "nationwide";
 }
 
 /* ---------------------------------------------------------------------
@@ -466,12 +469,19 @@ function boundingBox(center, radiusMiles) {
   };
 }
 
-// Fetches the *unfiltered* set of venues for a location (or nationwide NPS
-// parks when there's no location) and caches it per location. Text search is
-// applied client-side afterwards -- see matchesQuery -- so retyping the
-// search box re-filters instantly with zero extra queries.
-async function getVenuesNear(center, radiusMiles = 40) {
-  const key = cacheKeyFor(center);
+// Fetches venues matching the given location (if any) and search words (if
+// any), caches the result, and returns it. Three modes:
+//   1. Location given -> bounding-box query around that point (text words,
+//      if any, are applied client-side afterwards via matchesQuery, since
+//      the result set from a ~40mi box is already small).
+//   2. No location, but search words given -> nationwide text search done
+//      SERVER-SIDE (ilike across name/category/description, each word
+//      required, ANDed together) so typing "public art" browses the whole
+//      country without pulling all 15,000+ rows into the browser first.
+//   3. No location, no words -> nothing meaningful to show yet; caller
+//      handles this case before calling this function.
+async function getVenues({ center, words = [], radiusMiles = 40, resultLimit = 300 } = {}) {
+  const key = cacheKeyFor(center, words);
   const cached = locationCache.get(key);
   if (cached && (Date.now() - cached.timestamp < CACHE_TTL_MS)) {
     return cached.venues;
@@ -484,13 +494,22 @@ async function getVenuesNear(center, radiusMiles = 40) {
     query = query
       .gte("lat", box.minLat).lte("lat", box.maxLat)
       .gte("lng", box.minLng).lte("lng", box.maxLng);
+  } else if (words.length) {
+    // Nationwide text search, done in Postgres rather than the browser.
+    // Each word must match name OR category OR description (ilike); words
+    // are ANDed together by chaining .or() calls -- PostgREST ANDs repeated
+    // filter params together, so this becomes:
+    //   (word1 in name/category/description) AND (word2 in ...) AND ...
+    for (const w of words) {
+      const pattern = `%${w.replace(/[%_]/g, "")}%`; // strip SQL wildcard chars from user input
+      query = query.or(`name.ilike.${pattern},category.ilike.${pattern},description.ilike.${pattern}`);
+    }
   } else {
-    // No location given -- keep this fast and relevant by only pulling the
-    // small nationwide parks/monuments dataset instead of every venue.
-    query = query.eq("source", "nps");
+    // No location and no search words -- nothing to browse yet.
+    return [];
   }
 
-  const { data, error } = await query.limit(500);
+  const { data, error } = await query.limit(resultLimit);
   if (error) {
     console.error("Couldn't load venues:", error.message);
     return [];
@@ -579,20 +598,28 @@ async function runSearch({ q = "", location = "", limit = null, titleOverride = 
     grid.innerHTML = "";
     header.style.display = "none";
 
+    const words = q.toLowerCase().split(/\s+/).filter(Boolean);
     const center = location ? await geocodeLocation(location) : null;
 
     if (location && !center) {
-      statusLine.textContent = "Couldn't find that location -- showing National Park Service results nationwide only (add a valid city, state, or zip to also search museums nearby).";
-    } else if (!location) {
-      statusLine.textContent = "Add a city, state, or zip to search museums and galleries nearby -- showing National Park Service results nationwide only.";
+      statusLine.textContent = words.length
+        ? `Couldn't find that location -- showing nationwide results for "${q}" instead.`
+        : "Couldn't find that location -- add a valid city, state, or zip, or search by name/category to browse nationwide.";
+    } else if (!location && !words.length) {
+      statusLine.textContent = "Add a city, state, or zip, or type what you're looking for (e.g. \"public art\") to browse nationwide.";
+      header.style.display = "none";
+      return;
     } else {
       statusLine.textContent = "";
-      setCookie(LOCATION_COOKIE, location, 365); // remember it for next visit
+      if (location) setCookie(LOCATION_COOKIE, location, 365); // remember it for next visit
     }
 
-    const venues = await getVenuesNear(center);
-    const words = q.toLowerCase().split(/\s+/).filter(Boolean);
-    let merged = venues.filter(v => matchesQuery(v, words));
+    const venues = await getVenues({ center, words });
+    // When there's a location, the box query already narrowed things down --
+    // still run matchesQuery to also honor the search words within that area.
+    // When there's no location, the words were already applied server-side,
+    // so matchesQuery is a harmless no-op pass-through here.
+    let merged = center ? venues.filter(v => matchesQuery(v, words)) : venues;
 
     merged = await attachScores(merged);
     if (limit) merged = merged.slice(0, limit);
