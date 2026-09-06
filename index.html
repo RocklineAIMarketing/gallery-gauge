@@ -432,11 +432,11 @@ async function searchOverpass(center, radiusMiles = 25) {
   const query = `
     [out:json][timeout:25];
     (
-      node["tourism"="museum"](around:${radiusMeters},${center.lat},${center.lng});
-      node["tourism"="gallery"](around:${radiusMeters},${center.lat},${center.lng});
-      node["historic"="monument"](around:${radiusMeters},${center.lat},${center.lng});
+      nwr["tourism"="museum"](around:${radiusMeters},${center.lat},${center.lng});
+      nwr["tourism"="gallery"](around:${radiusMeters},${center.lat},${center.lng});
+      nwr["historic"="monument"](around:${radiusMeters},${center.lat},${center.lng});
     );
-    out body 30;
+    out center tags 60;
   `;
   const res = await fetch("https://overpass.kumi.systems/api/interpreter", {
     method: "POST",
@@ -452,8 +452,8 @@ async function searchOverpass(center, radiusMiles = 25) {
       category: el.tags.tourism === "gallery" ? "Gallery" : (el.tags.historic ? "Monument" : "Museum"),
       city: el.tags["addr:city"] || "",
       state: el.tags["addr:state"] || "",
-      lat: el.lat,
-      lng: el.lon,
+      lat: el.lat ?? el.center?.lat,
+      lng: el.lon ?? el.center?.lon,
       description: null,
       photo_url: null,
     }));
@@ -539,12 +539,13 @@ async function runSearch({ q = "", location = "", limit = null, titleOverride = 
 
     let merged = [...npsResults, ...osmResults];
     if (q) {
-      const qLower = q.toLowerCase();
-      merged = merged.filter(v =>
-        v.name.toLowerCase().includes(qLower) ||
-        v.category.toLowerCase().includes(qLower) ||
-        (v.description || "").toLowerCase().includes(qLower)
-      );
+      // Match on each word independently (not the whole phrase as one substring) --
+      // real names like "Museum of Modern Art" don't contain "art museum" verbatim.
+      const words = q.toLowerCase().split(/\s+/).filter(Boolean);
+      merged = merged.filter(v => {
+        const haystack = `${v.name} ${v.category} ${v.description || ""}`.toLowerCase();
+        return words.every(w => haystack.includes(w));
+      });
     }
 
     merged = await attachScores(merged);
