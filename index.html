@@ -317,7 +317,7 @@ if (!window.supabase) {
   throw new Error("Supabase CDN script did not load");
 }
 
-const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 let currentUser = null;
 let currentProfile = null;
@@ -327,7 +327,7 @@ let lastResults = []; // the merged venue list from the last search
    AUTH
 --------------------------------------------------------------------- */
 async function refreshAuthUI() {
-  const { data: { session } } = await supabase.auth.getSession();
+  const { data: { session } } = await supabaseClient.auth.getSession();
   currentUser = session?.user ?? null;
   const authArea = document.getElementById("authArea");
 
@@ -338,7 +338,7 @@ async function refreshAuthUI() {
     return;
   }
 
-  const { data: profile } = await supabase
+  const { data: profile } = await supabaseClient
     .from("profiles")
     .select("username, is_public")
     .eq("id", currentUser.id)
@@ -356,7 +356,7 @@ async function refreshAuthUI() {
     `;
   }
   document.getElementById("signOutBtn").onclick = async () => {
-    await supabase.auth.signOut();
+    await supabaseClient.auth.signOut();
     refreshAuthUI();
   };
 }
@@ -368,7 +368,7 @@ document.getElementById("sendMagicLink").onclick = async () => {
   const statusEl = document.getElementById("signInStatus");
   if (!email) { statusEl.textContent = "Enter an email first."; return; }
   statusEl.textContent = "Sending...";
-  const { error } = await supabase.auth.signInWithOtp({ email });
+  const { error } = await supabaseClient.auth.signInWithOtp({ email });
   statusEl.textContent = error ? `Error: ${error.message}` : "Check your email for the link.";
 };
 
@@ -376,7 +376,7 @@ document.getElementById("saveUsername").onclick = async () => {
   const username = document.getElementById("usernameInput").value.trim();
   const statusEl = document.getElementById("usernameStatus");
   if (!username) { statusEl.textContent = "Username can't be empty."; return; }
-  const { error } = await supabase
+  const { error } = await supabaseClient
     .from("profiles")
     .upsert({ id: currentUser.id, username, is_public: true }, { onConflict: "id" });
   if (error) { statusEl.textContent = `Error: ${error.message}`; return; }
@@ -384,7 +384,7 @@ document.getElementById("saveUsername").onclick = async () => {
   refreshAuthUI();
 };
 
-supabase.auth.onAuthStateChange(() => refreshAuthUI());
+supabaseClient.auth.onAuthStateChange(() => refreshAuthUI());
 
 function toggleOverlay(id, open) {
   document.getElementById(id).classList.toggle("open", open);
@@ -438,7 +438,7 @@ async function searchOverpass(center, radiusMiles = 25) {
     );
     out body 30;
   `;
-  const res = await fetch("https://overpass-api.de/api/interpreter", {
+  const res = await fetch("https://overpass.kumi.systems/api/interpreter", {
     method: "POST",
     body: new URLSearchParams({ data: query }),
   });
@@ -465,7 +465,7 @@ async function searchOverpass(center, radiusMiles = 25) {
 async function attachScores(venues) {
   if (!venues.length) return venues;
   const ids = venues.map(v => v.id);
-  const { data: rows, error } = await supabase
+  const { data: rows, error } = await supabaseClient
     .from("reviews")
     .select("place_id, score, user_id")
     .in("place_id", ids);
@@ -600,7 +600,7 @@ document.getElementById("saveCheckin").onclick = async () => {
   const statusEl = document.getElementById("checkinStatus");
   statusEl.textContent = "Saving...";
 
-  const { error } = await supabase
+  const { error } = await supabaseClient
     .from("reviews")
     .upsert(
       { user_id: currentUser.id, place_id: checkinTarget.id, place_name: checkinTarget.name, score },
