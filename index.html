@@ -292,16 +292,18 @@
 --------------------------------------------------------------------- */
 const SUPABASE_URL = "https://agzfkecmmczwxuazrtsh.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFnemZrZWNtbWN6d3h1YXpydHNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg2MDkwNDMsImV4cCI6MjEwNDE4NTA0M30.4OHP53uWqVri6pQrBS8fsKu0D9nqWMv6iFROEfwSgs8";
-const NPS_API_KEY = "yg2ocJ2tqasOg20BMwPoTf3DxQg8zNyxn0tcrUOy";
+// No NPS/OSM API keys here anymore -- venues are read straight out of the
+// `venues` table, which a separate periodic sync job keeps populated.
 
 /* ---------------------------------------------------------------------
-   NOTE ON SCHEMA ASSUMPTIONS
-   This assumes your `reviews` table has columns:
-     user_id (uuid), place_id (text), place_name (text), score (int),
-     with a unique constraint on (user_id, place_id) -- matching what
-     you already set up. And `profiles` has: id (uuid), username (text),
-     is_public (bool). If your real column names differ, search for
-     "reviews" and "profiles" below and adjust field names to match.
+   SCHEMA THIS PAGE EXPECTS (matches the SQL you ran in Supabase):
+     venues:   id (text pk, e.g. "nps:yell" / "osm:node/123"), name, category,
+               city, state, lat, lng, description, photo_url, source
+     profiles: id (uuid), username (text), is_public (bool)
+     reviews:  user_id (uuid), place_id (text), place_name (text), score (int),
+               unique (user_id, place_id)
+     place_scores: view -- place_id, place_name, avg_score, review_count
+                   (already filtered to public profiles only)
 --------------------------------------------------------------------- */
 
 // Surface any JS error on-page instead of failing totally silently
@@ -323,9 +325,10 @@ let currentUser = null;
 let currentProfile = null;
 let lastResults = []; // the merged venue list from the last search
 
-// Cache raw (unfiltered) NPS + OSM results per location, so retyping a
-// different search term for the same city re-filters instantly instead of
-// re-hitting both APIs. Cleared after 10 minutes so data doesn't go stale.
+// Cache the raw (unfiltered by search term) set of venues for a location, so
+// retyping a different search word for the same city re-filters instantly
+// instead of re-querying Supabase. Cleared after 10 minutes so a place added
+// by the sync job in the meantime still shows up on a fresh search.
 const locationCache = new Map();
 const CACHE_TTL_MS = 10 * 60 * 1000;
 
@@ -416,126 +419,110 @@ async function geocodeLocation(query) {
 }
 
 /* ---------------------------------------------------------------------
-   VENUE SOURCES -- live calls, no database of our own
+   VENUE SOURCE -- one indexed query against our own `venues` table.
+   No more live NPS/Overpass calls from the browser: the venues table is
+   kept fresh by a separate periodic sync job, so a search here is a single
+   fast Postgres query instead of two slow round-trips to external APIs.
 --------------------------------------------------------------------- */
-// NPS is a small, fast dataset (~500 parks) so it's cheap to query fresh every
-// time with the current search term. Overpass is the slow one, so its raw,
-// unfiltered result for a location is what gets cached and reused.
-async function getVenueData(center, q) {
+
+// Roughly convert a search radius in miles into a lat/lng bounding box.
+// Longitude degrees compress as you move away from the equator, so the
+// longitude delta is corrected by cos(latitude); latitude delta is not.
+function boundingBox(center, radiusMiles) {
+  const milesPerDegreeLat = 69;
+  const latDelta = radiusMiles / milesPerDegreeLat;
+  const milesPerDegreeLng = milesPerDegreeLat * Math.cos((center.lat * Math.PI) / 180);
+  const lngDelta = radiusMiles / Math.max(milesPerDegreeLng, 1); // guard near the poles
+  return {
+    minLat: center.lat - latDelta,
+    maxLat: center.lat + latDelta,
+    minLng: center.lng - lngDelta,
+    maxLng: center.lng + lngDelta,
+  };
+}
+
+// Fetches the *unfiltered* set of venues for a location (or nationwide NPS
+// parks when there's no location) and caches it per location. Text search is
+// applied client-side afterwards -- see matchesQuery -- so retyping the
+// search box re-filters instantly with zero extra queries.
+async function getVenuesNear(center, radiusMiles = 40) {
   const key = cacheKeyFor(center);
   const cached = locationCache.get(key);
-  const fresh = cached && (Date.now() - cached.timestamp < CACHE_TTL_MS);
+  if (cached && (Date.now() - cached.timestamp < CACHE_TTL_MS)) {
+    return cached.venues;
+  }
 
-  const [npsResults, osmResults] = await Promise.all([
-    searchNPS(q),
-    fresh ? Promise.resolve(cached.osmResults) : searchOverpass(center),
-  ]);
+  let query = supabaseClient.from("venues").select("*");
 
-  if (!fresh) locationCache.set(key, { timestamp: Date.now(), osmResults });
+  if (center) {
+    const box = boundingBox(center, radiusMiles);
+    query = query
+      .gte("lat", box.minLat).lte("lat", box.maxLat)
+      .gte("lng", box.minLng).lte("lng", box.maxLng);
+  } else {
+    // No location given -- keep this fast and relevant by only pulling the
+    // small nationwide parks/monuments dataset instead of every venue.
+    query = query.eq("source", "nps");
+  }
 
-  return [npsResults, osmResults];
+  const { data, error } = await query.limit(500);
+  if (error) {
+    console.error("Couldn't load venues:", error.message);
+    return [];
+  }
+
+  locationCache.set(key, { timestamp: Date.now(), venues: data });
+  return data;
 }
 
-async function searchNPS(q) {
-  const url = `https://developer.nps.gov/api/v1/parks?q=${encodeURIComponent(q || "")}&limit=50&api_key=${NPS_API_KEY}`;
-  const res = await fetch(url);
-  if (!res.ok) return [];
-  const json = await res.json();
-  return (json.data || [])
-    .filter(p => p.latitude && p.longitude)
-    .map(p => ({
-      id: `nps:${p.parkCode}`,
-      name: p.fullName,
-      category: /monument|historic/i.test(p.designation || "") ? "National monument" : "National park",
-      city: p.addresses?.[0]?.city || "",
-      state: p.states?.split(",")[0] || "",
-      lat: parseFloat(p.latitude),
-      lng: parseFloat(p.longitude),
-      description: p.description,
-      photo_url: p.images?.[0]?.url || null,
-    }));
-}
-
-async function searchOverpass(center, radiusMiles = 40) {
-  if (!center) return [];
-  const radiusMeters = Math.round(radiusMiles * 1609.34);
-  // Consolidated into fewer "around" clauses using regex alternation on shared
-  // keys -- each separate clause is a full spatial scan, so cutting 9 down to
-  // 4 is the biggest lever on speed without dropping any category.
-  const query = `
-    [out:json][timeout:30];
-    (
-      nwr["tourism"~"^(museum|gallery|artwork)$"](around:${radiusMeters},${center.lat},${center.lng});
-      nwr["historic"~"^(monument|memorial|archaeological_site)$"](around:${radiusMeters},${center.lat},${center.lng});
-      nwr["amenity"="arts_centre"](around:${radiusMeters},${center.lat},${center.lng});
-      nwr["leisure"="park"]["protection_title"~"State Park",i](around:${radiusMeters},${center.lat},${center.lng});
-      nwr["boundary"="protected_area"]["protect_class"="24"](around:${radiusMeters},${center.lat},${center.lng});
-    );
-    out center tags 150;
-  `;
-  const res = await fetch("https://overpass.kumi.systems/api/interpreter", {
-    method: "POST",
-    body: new URLSearchParams({ data: query }),
-  });
-  if (!res.ok) return [];
-  const json = await res.json();
-  return (json.elements || [])
-    .filter(el => el.tags?.name)
-    .map(el => ({
-      id: `osm:${el.type}/${el.id}`,
-      name: el.tags.name,
-      category: categorizeOsmTags(el.tags),
-      city: el.tags["addr:city"] || "",
-      state: el.tags["addr:state"] || "",
-      lat: el.lat ?? el.center?.lat,
-      lng: el.lon ?? el.center?.lon,
-      description: null,
-      photo_url: null,
-    }));
-}
-
-function categorizeOsmTags(tags) {
-  if (tags.tourism === "gallery") return "Gallery";
-  if (tags.tourism === "artwork") return "Public art";
-  if (tags.amenity === "arts_centre") return "Arts center";
-  if (tags.protection_title || tags.protect_class === "24") return "State park";
-  if (tags.historic === "memorial") return "Memorial";
-  if (tags.historic === "archaeological_site") return "Archaeological site";
-  if (tags.historic === "monument") return "Monument";
-  return "Museum";
+function matchesQuery(v, words) {
+  if (!words.length) return true;
+  // Match each word independently (not the whole phrase as one substring) --
+  // real names like "Museum of Modern Art" don't contain "art museum" verbatim.
+  const haystack = `${v.name} ${v.category} ${v.description || ""}`.toLowerCase();
+  return words.every(w => haystack.includes(w));
 }
 
 /* ---------------------------------------------------------------------
-   REVIEWS -- pull scores from Supabase for whatever venues came back
+   REVIEWS -- attach scores for whatever venues came back.
+   Two small, targeted queries instead of pulling every raw review row:
+     1. place_scores -- a pre-aggregated view (one row per place, already
+        rounded and already restricted to public profiles).
+     2. the signed-in user's own reviews for these places, so a private
+        or public user always sees their own score regardless of the
+        place_scores filter above -- RLS already limits this query to
+        rows where user_id = auth.uid().
 --------------------------------------------------------------------- */
 async function attachScores(venues) {
   if (!venues.length) return venues;
   const ids = venues.map(v => v.id);
-  const { data: rows, error } = await supabaseClient
-    .from("reviews")
-    .select("place_id, score, user_id")
+
+  const scoresPromise = supabaseClient
+    .from("place_scores")
+    .select("place_id, avg_score, review_count")
     .in("place_id", ids);
 
-  if (error) {
-    console.error("Couldn't load reviews:", error.message);
-    return venues;
-  }
+  const minePromise = currentUser
+    ? supabaseClient.from("reviews").select("place_id, score").eq("user_id", currentUser.id).in("place_id", ids)
+    : Promise.resolve({ data: [] });
+
+  const [{ data: scoreRows, error: scoreErr }, { data: mineRows, error: mineErr }] =
+    await Promise.all([scoresPromise, minePromise]);
+
+  if (scoreErr) console.error("Couldn't load place scores:", scoreErr.message);
+  if (mineErr) console.error("Couldn't load your reviews:", mineErr.message);
 
   const byPlace = {};
-  for (const row of rows) {
-    (byPlace[row.place_id] ||= []).push(row);
-  }
+  for (const row of scoreRows || []) byPlace[row.place_id] = row;
+  const mineByPlace = {};
+  for (const row of mineRows || []) mineByPlace[row.place_id] = row.score;
 
-  return venues.map(v => {
-    const placeReviews = byPlace[v.id] || [];
-    const avg = placeReviews.length
-      ? placeReviews.reduce((s, r) => s + r.score, 0) / placeReviews.length
-      : null;
-    const mine = currentUser
-      ? placeReviews.find(r => r.user_id === currentUser.id)?.score ?? null
-      : null;
-    return { ...v, avgScore: avg, reviewCount: placeReviews.length, myScore: mine };
-  });
+  return venues.map(v => ({
+    ...v,
+    avgScore: byPlace[v.id]?.avg_score ?? null,
+    reviewCount: byPlace[v.id]?.review_count ?? 0,
+    myScore: mineByPlace[v.id] ?? null,
+  }));
 }
 
 /* ---------------------------------------------------------------------
@@ -578,18 +565,9 @@ async function runSearch({ q = "", location = "", limit = null, titleOverride = 
       setCookie(LOCATION_COOKIE, location, 365); // remember it for next visit
     }
 
-    const [npsResults, osmResults] = await getVenueData(center, q);
-
-    let merged = [...npsResults, ...osmResults];
-    if (q) {
-      // Match on each word independently (not the whole phrase as one substring) --
-      // real names like "Museum of Modern Art" don't contain "art museum" verbatim.
-      const words = q.toLowerCase().split(/\s+/).filter(Boolean);
-      merged = merged.filter(v => {
-        const haystack = `${v.name} ${v.category} ${v.description || ""}`.toLowerCase();
-        return words.every(w => haystack.includes(w));
-      });
-    }
+    const venues = await getVenuesNear(center);
+    const words = q.toLowerCase().split(/\s+/).filter(Boolean);
+    let merged = venues.filter(v => matchesQuery(v, words));
 
     merged = await attachScores(merged);
     if (limit) merged = merged.slice(0, limit);
