@@ -292,8 +292,14 @@
 --------------------------------------------------------------------- */
 const SUPABASE_URL = "https://agzfkecmmczwxuazrtsh.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFnemZrZWNtbWN6d3h1YXpydHNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg2MDkwNDMsImV4cCI6MjEwNDE4NTA0M30.4OHP53uWqVri6pQrBS8fsKu0D9nqWMv6iFROEfwSgs8";
-// No NPS/OSM API keys here anymore -- venues are read straight out of the
-// `venues` table, which a separate periodic sync job keeps populated.
+
+// Geoapify key -- used client-side for geocoding the "City, state, or zip"
+// field. This is the SAME key used server-side in sync-venues.mjs; Geoapify
+// keys are fine to expose in frontend code (that's the intended usage for
+// their JS/browser tier), but you should still add your site's domain to
+// the key's allowed referrers in the Geoapify dashboard to stop other sites
+// from burning your quota. Get/manage it at https://myprojects.geoapify.com/
+const GEOAPIFY_API_KEY = "YOUR_GEOAPIFY_API_KEY";
 
 /* ---------------------------------------------------------------------
    SCHEMA THIS PAGE EXPECTS (matches the SQL you ran in Supabase):
@@ -406,16 +412,35 @@ function toggleOverlay(id, open) {
 }
 
 /* ---------------------------------------------------------------------
-   GEOCODING -- Nominatim (OpenStreetMap), free + CORS-friendly for light use
+   GEOCODING -- Geoapify Geocoding API
+   Switched from Nominatim (OpenStreetMap) because Nominatim's usage
+   policy requires a proper identifying User-Agent and heavily rate-limits
+   or blocks plain client-side fetch() calls with no headers -- which is
+   exactly what a browser was sending here. That made geocodeLocation()
+   fail silently for most searches, and the site would fall back to
+   NPS-only results even when a valid location was typed in. Geoapify is
+   built for direct client-side use with an API key and has a generous
+   free tier -- same key you're already using in sync-venues.mjs works
+   here (see the GEOAPIFY_API_KEY config var above).
 --------------------------------------------------------------------- */
 async function geocodeLocation(query) {
   if (!query) return null;
-  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const data = await res.json();
-  if (!data.length) return null;
-  return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+  const url = `https://api.geoapify.com/v1/geocode/search?text=${encodeURIComponent(query)}&limit=1&filter=countrycode:us&apiKey=${GEOAPIFY_API_KEY}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.error(`Geoapify geocoding error (${res.status}): ${await res.text()}`);
+      return null;
+    }
+    const data = await res.json();
+    const feature = data.features?.[0];
+    if (!feature) return null;
+    const [lng, lat] = feature.geometry.coordinates;
+    return { lat, lng };
+  } catch (err) {
+    console.error("Geoapify geocoding request failed:", err);
+    return null;
+  }
 }
 
 /* ---------------------------------------------------------------------
