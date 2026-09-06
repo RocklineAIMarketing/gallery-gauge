@@ -403,21 +403,6 @@ async function geocodeLocation(query) {
   return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
 }
 
-// Overpass can only search around a point -- if the person didn't type a
-// location, fall back to the browser's own location so museum/gallery
-// results still show up.
-function tryBrowserLocation(timeoutMs = 4000) {
-  return new Promise((resolve) => {
-    if (!navigator.geolocation) { resolve(null); return; }
-    const timer = setTimeout(() => resolve(null), timeoutMs);
-    navigator.geolocation.getCurrentPosition(
-      (pos) => { clearTimeout(timer); resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }); },
-      () => { clearTimeout(timer); resolve(null); },
-      { timeout: timeoutMs }
-    );
-  });
-}
-
 /* ---------------------------------------------------------------------
    VENUE SOURCES -- live calls, no database of our own
 --------------------------------------------------------------------- */
@@ -508,67 +493,89 @@ async function attachScores(venues) {
 }
 
 /* ---------------------------------------------------------------------
+   COOKIES -- remember the last location searched, so we can auto-load
+   nearby results next visit without asking again
+--------------------------------------------------------------------- */
+const LOCATION_COOKIE = "gg_last_location";
+
+function setCookie(name, value, days) {
+  const expires = new Date(Date.now() + days * 864e5).toUTCString();
+  document.cookie = `${name}=${encodeURIComponent(value)}; expires=${expires}; path=/; SameSite=Lax`;
+}
+
+function getCookie(name) {
+  const match = document.cookie.match(new RegExp(`(?:^|; )${name}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+/* ---------------------------------------------------------------------
    SEARCH FLOW
 --------------------------------------------------------------------- */
-document.getElementById("searchForm").addEventListener("submit", async (e) => {
-  e.preventDefault();
+async function runSearch({ q = "", location = "", limit = null, titleOverride = null } = {}) {
   const statusLine = document.getElementById("statusLine");
-  try {
-  const q = document.getElementById("q").value.trim();
-  const location = document.getElementById("location").value.trim();
   const grid = document.getElementById("resultsGrid");
   const header = document.getElementById("resultsHeader");
 
-  statusLine.textContent = "Searching...";
-  grid.innerHTML = "";
-  header.style.display = "none";
+  try {
+    statusLine.textContent = "Searching...";
+    grid.innerHTML = "";
+    header.style.display = "none";
 
-  const center = location ? await geocodeLocation(location) : await tryBrowserLocation();
-  const usedBrowserLocation = !location && !!center;
+    const center = location ? await geocodeLocation(location) : null;
 
-  if (location && !center) {
-    statusLine.textContent = "Couldn't find that location -- showing National Park Service results nationwide only (add a valid city, state, or zip to also search museums nearby).";
-  } else if (!location && !center) {
-    statusLine.textContent = "Add a city, state, or zip (or allow location access) to search museums and galleries nearby -- showing National Park Service results nationwide only.";
-  } else {
-    statusLine.textContent = "";
-  }
+    if (location && !center) {
+      statusLine.textContent = "Couldn't find that location -- showing National Park Service results nationwide only (add a valid city, state, or zip to also search museums nearby).";
+    } else if (!location) {
+      statusLine.textContent = "Add a city, state, or zip to search museums and galleries nearby -- showing National Park Service results nationwide only.";
+    } else {
+      statusLine.textContent = "";
+      setCookie(LOCATION_COOKIE, location, 365); // remember it for next visit
+    }
 
-  const [npsResults, osmResults] = await Promise.all([
-    searchNPS(q),
-    searchOverpass(center),
-  ]);
+    const [npsResults, osmResults] = await Promise.all([
+      searchNPS(q),
+      searchOverpass(center),
+    ]);
 
-  let merged = [...npsResults, ...osmResults];
-  if (q) {
-    const qLower = q.toLowerCase();
-    merged = merged.filter(v =>
-      v.name.toLowerCase().includes(qLower) ||
-      v.category.toLowerCase().includes(qLower) ||
-      (v.description || "").toLowerCase().includes(qLower)
-    );
-  }
+    let merged = [...npsResults, ...osmResults];
+    if (q) {
+      const qLower = q.toLowerCase();
+      merged = merged.filter(v =>
+        v.name.toLowerCase().includes(qLower) ||
+        v.category.toLowerCase().includes(qLower) ||
+        (v.description || "").toLowerCase().includes(qLower)
+      );
+    }
 
-  merged = await attachScores(merged);
-  lastResults = merged;
+    merged = await attachScores(merged);
+    if (limit) merged = merged.slice(0, limit);
+    lastResults = merged;
 
-  header.style.display = "flex";
-  document.getElementById("resultsTitle").textContent = q ? `Results for "${q}"` : "All venues";
-  document.getElementById("resultsCount").textContent = `${merged.length} found`;
+    header.style.display = "flex";
+    document.getElementById("resultsTitle").textContent =
+      titleOverride || (q ? `Results for "${q}"` : "All venues");
+    document.getElementById("resultsCount").textContent = `${merged.length} found`;
 
-  if (!merged.length) {
-    grid.innerHTML = `<p style="grid-column:1/-1;text-align:center;color:var(--taupe);padding:40px 0;">Nothing matched. Try a broader term or a different location.</p>`;
-    return;
-  }
+    if (!merged.length) {
+      grid.innerHTML = `<p style="grid-column:1/-1;text-align:center;color:var(--taupe);padding:40px 0;">Nothing matched. Try a broader term or a different location.</p>`;
+      return;
+    }
 
-  grid.innerHTML = merged.map(renderCard).join("");
-  merged.forEach(v => {
-    document.getElementById(`card-${cssSafe(v.id)}`).onclick = () => openCheckin(v);
-  });
+    grid.innerHTML = merged.map(renderCard).join("");
+    merged.forEach(v => {
+      document.getElementById(`card-${cssSafe(v.id)}`).onclick = () => openCheckin(v);
+    });
   } catch (err) {
     console.error(err);
     statusLine.textContent = "Search failed: " + err.message + " (see browser console for details)";
   }
+}
+
+document.getElementById("searchForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const q = document.getElementById("q").value.trim();
+  const location = document.getElementById("location").value.trim();
+  runSearch({ q, location });
 });
 
 function cssSafe(id) { return id.replace(/[^a-zA-Z0-9]/g, "_"); }
@@ -643,6 +650,13 @@ document.getElementById("saveCheckin").onclick = async () => {
    INIT
 --------------------------------------------------------------------- */
 refreshAuthUI();
+
+// Auto-load 6 nearby results if we remember a location from a past visit
+const savedLocation = getCookie(LOCATION_COOKIE);
+if (savedLocation) {
+  document.getElementById("location").value = savedLocation;
+  runSearch({ location: savedLocation, limit: 6, titleOverride: "Near you" });
+}
 </script>
 
 </body>
