@@ -63,7 +63,7 @@ async function fetchNPS() {
 const US_BOUNDS = { minLat: 24.5, maxLat: 49.5, minLng: -125, maxLng: -66.9 };
 const GRID_COLS = 8;
 const GRID_ROWS = 5;
-const PAUSE_MS = 2000;
+const PAUSE_MS = 8000;       // base pause between cells -- Overpass free mirrors rate-limit hard
 
 function buildGridCells() {
   const cells = [];
@@ -93,6 +93,35 @@ function categorizeOsmTags(tags) {
   return "Museum";
 }
 
+const OVERPASS_ENDPOINTS = [
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass-api.de/api/interpreter",
+];
+
+async function fetchWithRetry(endpoint, query, maxRetries = 4) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      body: new URLSearchParams({ data: query }),
+    });
+
+    if (res.status === 429) {
+      if (attempt === maxRetries) return { res, body: await res.text() };
+      // Respect Retry-After if the server sent one, else back off exponentially
+      // (10s, 20s, 40s...) plus a little jitter.
+      const retryAfter = parseInt(res.headers.get("retry-after") || "", 10);
+      const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : 10000 * 2 ** (attempt - 1) + Math.random() * 1000;
+      console.warn(`  ${endpoint} rate-limited (429), waiting ${Math.round(waitMs / 1000)}s (retry ${attempt}/${maxRetries})...`);
+      await new Promise(r => setTimeout(r, waitMs));
+      continue;
+    }
+
+    return { res, body: res.ok ? null : await res.text() };
+  }
+}
+
 async function fetchOverpassCell(bbox) {
   const bboxStr = `${bbox.south},${bbox.west},${bbox.north},${bbox.east}`;
   const query = `
@@ -107,30 +136,38 @@ async function fetchOverpassCell(bbox) {
     out center tags 500;
   `;
 
-  const res = await fetch("https://overpass.kumi.systems/api/interpreter", {
-    method: "POST",
-    body: new URLSearchParams({ data: query }),
-  });
-  if (!res.ok) {
-    console.warn(`  Overpass cell failed (${res.status}), skipping this cell`);
-    return [];
+  let lastError = null;
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    try {
+      const { res, body } = await fetchWithRetry(endpoint, query);
+      if (!res.ok) {
+        lastError = `${res.status} ${res.statusText} -- ${(body || "").slice(0, 200)}`;
+        console.warn(`  ${endpoint} failed: ${lastError}`);
+        continue; // try the next endpoint
+      }
+      const json = await res.json();
+      return (json.elements || [])
+        .filter(el => el.tags?.name)
+        .map(el => ({
+          id: `osm:${el.type}/${el.id}`,
+          name: el.tags.name,
+          category: categorizeOsmTags(el.tags),
+          city: el.tags["addr:city"] || null,
+          state: el.tags["addr:state"] || null,
+          lat: el.lat ?? el.center?.lat,
+          lng: el.lon ?? el.center?.lon,
+          description: null,
+          photo_url: null,
+          source: "osm",
+        }));
+    } catch (err) {
+      lastError = err.message;
+      console.warn(`  ${endpoint} threw: ${err.message}`);
+    }
   }
-  const json = await res.json();
 
-  return (json.elements || [])
-    .filter(el => el.tags?.name)
-    .map(el => ({
-      id: `osm:${el.type}/${el.id}`,
-      name: el.tags.name,
-      category: categorizeOsmTags(el.tags),
-      city: el.tags["addr:city"] || null,
-      state: el.tags["addr:state"] || null,
-      lat: el.lat ?? el.center?.lat,
-      lng: el.lon ?? el.center?.lon,
-      description: null,
-      photo_url: null,
-      source: "osm",
-    }));
+  console.warn(`  All Overpass endpoints failed for this cell. Last error: ${lastError}`);
+  return [];
 }
 
 async function fetchAllOSM() {
