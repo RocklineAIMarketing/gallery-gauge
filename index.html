@@ -403,6 +403,21 @@ async function geocodeLocation(query) {
   return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
 }
 
+// Overpass can only search around a point -- if the person didn't type a
+// location, fall back to the browser's own location so museum/gallery
+// results still show up.
+function tryBrowserLocation(timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    if (!navigator.geolocation) { resolve(null); return; }
+    const timer = setTimeout(() => resolve(null), timeoutMs);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => { clearTimeout(timer); resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }); },
+      () => { clearTimeout(timer); resolve(null); },
+      { timeout: timeoutMs }
+    );
+  });
+}
+
 /* ---------------------------------------------------------------------
    VENUE SOURCES -- live calls, no database of our own
 --------------------------------------------------------------------- */
@@ -508,9 +523,15 @@ document.getElementById("searchForm").addEventListener("submit", async (e) => {
   grid.innerHTML = "";
   header.style.display = "none";
 
-  const center = location ? await geocodeLocation(location) : null;
+  const center = location ? await geocodeLocation(location) : await tryBrowserLocation();
+  const usedBrowserLocation = !location && !!center;
+
   if (location && !center) {
-    statusLine.textContent = "Couldn't find that location -- showing nationwide NPS results instead.";
+    statusLine.textContent = "Couldn't find that location -- showing National Park Service results nationwide only (add a valid city, state, or zip to also search museums nearby).";
+  } else if (!location && !center) {
+    statusLine.textContent = "Add a city, state, or zip (or allow location access) to search museums and galleries nearby -- showing National Park Service results nationwide only.";
+  } else {
+    statusLine.textContent = "";
   }
 
   const [npsResults, osmResults] = await Promise.all([
@@ -530,9 +551,6 @@ document.getElementById("searchForm").addEventListener("submit", async (e) => {
 
   merged = await attachScores(merged);
   lastResults = merged;
-
-  if (!location) statusLine.textContent = "";
-  else if (center) statusLine.textContent = "";
 
   header.style.display = "flex";
   document.getElementById("resultsTitle").textContent = q ? `Results for "${q}"` : "All venues";
