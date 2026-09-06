@@ -407,7 +407,7 @@ async function geocodeLocation(query) {
    VENUE SOURCES -- live calls, no database of our own
 --------------------------------------------------------------------- */
 async function searchNPS(q) {
-  const url = `https://developer.nps.gov/api/v1/parks?q=${encodeURIComponent(q || "")}&limit=20&api_key=${NPS_API_KEY}`;
+  const url = `https://developer.nps.gov/api/v1/parks?q=${encodeURIComponent(q || "")}&limit=50&api_key=${NPS_API_KEY}`;
   const res = await fetch(url);
   if (!res.ok) return [];
   const json = await res.json();
@@ -426,17 +426,23 @@ async function searchNPS(q) {
     }));
 }
 
-async function searchOverpass(center, radiusMiles = 25) {
+async function searchOverpass(center, radiusMiles = 50) {
   if (!center) return [];
   const radiusMeters = Math.round(radiusMiles * 1609.34);
   const query = `
-    [out:json][timeout:25];
+    [out:json][timeout:50];
     (
       nwr["tourism"="museum"](around:${radiusMeters},${center.lat},${center.lng});
       nwr["tourism"="gallery"](around:${radiusMeters},${center.lat},${center.lng});
+      nwr["tourism"="artwork"](around:${radiusMeters},${center.lat},${center.lng});
+      nwr["amenity"="arts_centre"](around:${radiusMeters},${center.lat},${center.lng});
       nwr["historic"="monument"](around:${radiusMeters},${center.lat},${center.lng});
+      nwr["historic"="memorial"](around:${radiusMeters},${center.lat},${center.lng});
+      nwr["historic"="archaeological_site"](around:${radiusMeters},${center.lat},${center.lng});
+      nwr["leisure"="park"]["protection_title"~"State Park",i](around:${radiusMeters},${center.lat},${center.lng});
+      nwr["boundary"="protected_area"]["protect_class"="24"](around:${radiusMeters},${center.lat},${center.lng});
     );
-    out center tags 60;
+    out center tags 200;
   `;
   const res = await fetch("https://overpass.kumi.systems/api/interpreter", {
     method: "POST",
@@ -449,7 +455,7 @@ async function searchOverpass(center, radiusMiles = 25) {
     .map(el => ({
       id: `osm:${el.type}/${el.id}`,
       name: el.tags.name,
-      category: el.tags.tourism === "gallery" ? "Gallery" : (el.tags.historic ? "Monument" : "Museum"),
+      category: categorizeOsmTags(el.tags),
       city: el.tags["addr:city"] || "",
       state: el.tags["addr:state"] || "",
       lat: el.lat ?? el.center?.lat,
@@ -457,6 +463,17 @@ async function searchOverpass(center, radiusMiles = 25) {
       description: null,
       photo_url: null,
     }));
+}
+
+function categorizeOsmTags(tags) {
+  if (tags.tourism === "gallery") return "Gallery";
+  if (tags.tourism === "artwork") return "Public art";
+  if (tags.amenity === "arts_centre") return "Arts center";
+  if (tags.protection_title || tags.protect_class === "24") return "State park";
+  if (tags.historic === "memorial") return "Memorial";
+  if (tags.historic === "archaeological_site") return "Archaeological site";
+  if (tags.historic === "monument") return "Monument";
+  return "Museum";
 }
 
 /* ---------------------------------------------------------------------
