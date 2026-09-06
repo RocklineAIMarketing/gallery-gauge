@@ -1,8 +1,9 @@
 // sync-venues.mjs
 //
-// Populates the `venues` table from NPS + OpenStreetMap. Run this once to
-// seed the table, then on a schedule (cron / GitHub Action / Supabase
-// scheduled Edge Function) to keep it fresh.
+// Populates the `venues` table from NPS + Geoapify (museums, galleries,
+// monuments, sourced from OpenStreetMap via Geoapify's Places API). Run
+// this once to seed the table, then on a schedule (cron / GitHub Action /
+// Supabase scheduled Edge Function) to keep it fresh.
 //
 // Requires Node 18+ (built-in fetch) and the supabase-js package:
 //   npm install @supabase/supabase-js
@@ -13,9 +14,10 @@
 //                                (NOT the anon key -- this one bypasses RLS,
 //                                 keep it out of any client-side code/repo)
 //   NPS_API_KEY               -- your existing NPS key, now used server-side only
+//   GEOAPIFY_API_KEY          -- free at https://myprojects.geoapify.com/
 //
 // Run:
-//   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... NPS_API_KEY=... node sync-venues.mjs
+//   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... NPS_API_KEY=... GEOAPIFY_API_KEY=... node sync-venues.mjs
 
 import { createClient } from "@supabase/supabase-js";
 
@@ -56,14 +58,35 @@ async function fetchNPS() {
 }
 
 /* ---------------------------------------------------------------------
-   OSM via Overpass -- too much data for one nationwide query, so the
-   continental US is split into a grid and queried cell by cell, with a
-   short pause between calls to stay polite to the free Overpass instance.
+   MUSEUMS/GALLERIES/MONUMENTS via Geoapify Places API
+   Geoapify wraps OSM data behind a real, paid-tier-grade API -- reliable
+   from CI/datacenter IPs, unlike the free public Overpass mirrors, which
+   either rate-limit hard or outright block shared GitHub Actions IPs.
+   Free tier: https://www.geoapify.com/pricing (generous daily quota).
 --------------------------------------------------------------------- */
+const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
+if (!GEOAPIFY_API_KEY) {
+  console.error("Missing required env var: GEOAPIFY_API_KEY");
+  process.exit(1);
+}
+
 const US_BOUNDS = { minLat: 24.5, maxLat: 49.5, minLng: -125, maxLng: -66.9 };
 const GRID_COLS = 8;
 const GRID_ROWS = 5;
-const PAUSE_MS = 8000;       // base pause between cells -- Overpass free mirrors rate-limit hard
+const PAUSE_MS = 1500;
+const MAX_RUN_MS = 8 * 60 * 1000; // safety cap -- should finish well under this
+
+// Verified against Geoapify's published category enum
+// (https://apidocs.geoapify.com/docs/places/#categories):
+const GEOAPIFY_CATEGORIES = [
+  "entertainment.museum",
+  "entertainment.culture.gallery",
+  "entertainment.culture.arts_centre",
+  "tourism.sights.memorial",
+  "tourism.attraction.artwork",
+  "natural.protected_area", // closest match to "state park" -- OSM has no
+                            // dedicated state-park tag Geoapify exposes
+].join(",");
 
 function buildGridCells() {
   const cells = [];
@@ -82,101 +105,65 @@ function buildGridCells() {
   return cells;
 }
 
-function categorizeOsmTags(tags) {
-  if (tags.tourism === "gallery") return "Gallery";
-  if (tags.tourism === "artwork") return "Public art";
-  if (tags.amenity === "arts_centre") return "Arts center";
-  if (tags.protection_title || tags.protect_class === "24") return "State park";
-  if (tags.historic === "memorial") return "Memorial";
-  if (tags.historic === "archaeological_site") return "Archaeological site";
-  if (tags.historic === "monument") return "Monument";
-  return "Museum";
+function categorizeGeoapify(categories) {
+  const cats = categories || [];
+  if (cats.includes("entertainment.culture.gallery")) return "Gallery";
+  if (cats.includes("entertainment.culture.arts_centre")) return "Arts center";
+  if (cats.some(c => c.startsWith("tourism.attraction.artwork"))) return "Public art";
+  if (cats.some(c => c.startsWith("tourism.sights.memorial.monument"))) return "Monument";
+  if (cats.some(c => c.startsWith("tourism.sights.memorial"))) return "Memorial";
+  if (cats.includes("natural.protected_area")) return "State park";
+  return "Museum"; // entertainment.museum, and sane default
 }
 
-const OVERPASS_ENDPOINTS = [
-  "https://overpass.kumi.systems/api/interpreter",
-  "https://overpass-api.de/api/interpreter",
-];
+async function fetchGeoapifyCell(bbox) {
+  const rect = `rect:${bbox.west},${bbox.south},${bbox.east},${bbox.north}`;
+  const url = `https://api.geoapify.com/v2/places?categories=${GEOAPIFY_CATEGORIES}&filter=${encodeURIComponent(rect)}&limit=500`;
 
-async function fetchWithRetry(endpoint, query, maxRetries = 4) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const res = await fetch(endpoint, {
-      method: "POST",
-      body: new URLSearchParams({ data: query }),
-    });
+  const doFetch = () => fetch(url, { headers: { "x-api-key": GEOAPIFY_API_KEY } });
 
-    if (res.status === 429) {
-      if (attempt === maxRetries) return { res, body: await res.text() };
-      // Respect Retry-After if the server sent one, else back off exponentially
-      // (10s, 20s, 40s...) plus a little jitter.
-      const retryAfter = parseInt(res.headers.get("retry-after") || "", 10);
-      const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
-        ? retryAfter * 1000
-        : 10000 * 2 ** (attempt - 1) + Math.random() * 1000;
-      console.warn(`  ${endpoint} rate-limited (429), waiting ${Math.round(waitMs / 1000)}s (retry ${attempt}/${maxRetries})...`);
-      await new Promise(r => setTimeout(r, waitMs));
-      continue;
-    }
-
-    return { res, body: res.ok ? null : await res.text() };
-  }
-}
-
-async function fetchOverpassCell(bbox) {
-  const bboxStr = `${bbox.south},${bbox.west},${bbox.north},${bbox.east}`;
-  const query = `
-    [out:json][timeout:60];
-    (
-      nwr["tourism"~"^(museum|gallery|artwork)$"](${bboxStr});
-      nwr["historic"~"^(monument|memorial|archaeological_site)$"](${bboxStr});
-      nwr["amenity"="arts_centre"](${bboxStr});
-      nwr["leisure"="park"]["protection_title"~"State Park",i](${bboxStr});
-      nwr["boundary"="protected_area"]["protect_class"="24"](${bboxStr});
-    );
-    out center tags 500;
-  `;
-
-  let lastError = null;
-  for (const endpoint of OVERPASS_ENDPOINTS) {
-    try {
-      const { res, body } = await fetchWithRetry(endpoint, query);
-      if (!res.ok) {
-        lastError = `${res.status} ${res.statusText} -- ${(body || "").slice(0, 200)}`;
-        console.warn(`  ${endpoint} failed: ${lastError}`);
-        continue; // try the next endpoint
-      }
-      const json = await res.json();
-      return (json.elements || [])
-        .filter(el => el.tags?.name)
-        .map(el => ({
-          id: `osm:${el.type}/${el.id}`,
-          name: el.tags.name,
-          category: categorizeOsmTags(el.tags),
-          city: el.tags["addr:city"] || null,
-          state: el.tags["addr:state"] || null,
-          lat: el.lat ?? el.center?.lat,
-          lng: el.lon ?? el.center?.lon,
-          description: null,
-          photo_url: null,
-          source: "osm",
-        }));
-    } catch (err) {
-      lastError = err.message;
-      console.warn(`  ${endpoint} threw: ${err.message}`);
-    }
+  let res = await doFetch();
+  if (res.status === 429) {
+    console.warn("  Geoapify rate-limited (429), waiting 5s then trying once more...");
+    await new Promise(r => setTimeout(r, 5000));
+    res = await doFetch();
   }
 
-  console.warn(`  All Overpass endpoints failed for this cell. Last error: ${lastError}`);
-  return [];
+  if (!res.ok) {
+    const body = await res.text();
+    console.warn(`  Geoapify request failed (${res.status}): ${body.slice(0, 200)}`);
+    return [];
+  }
+
+  const json = await res.json();
+  return (json.features || [])
+    .filter(f => f.properties?.name && f.properties?.place_id)
+    .map(f => ({
+      id: `geoapify:${f.properties.place_id}`,
+      name: f.properties.name,
+      category: categorizeGeoapify(f.properties.categories),
+      city: f.properties.city || null,
+      state: f.properties.state_code || f.properties.state || null,
+      lat: f.properties.lat,
+      lng: f.properties.lon,
+      description: null,
+      photo_url: null,
+      source: "osm",
+    }));
 }
 
 async function fetchAllOSM() {
   const cells = buildGridCells();
   const byId = new Map(); // dedupe -- a venue near a cell boundary can appear twice
+  const deadline = Date.now() + MAX_RUN_MS;
 
   for (let i = 0; i < cells.length; i++) {
-    console.log(`  Overpass cell ${i + 1}/${cells.length}...`);
-    const results = await fetchOverpassCell(cells[i]);
+    if (Date.now() > deadline) {
+      console.warn(`  Time budget (${MAX_RUN_MS / 60000}min) reached -- stopping at cell ${i + 1}/${cells.length}. Next run will cover the rest.`);
+      break;
+    }
+    console.log(`  Geoapify cell ${i + 1}/${cells.length}...`);
+    const results = await fetchGeoapifyCell(cells[i]);
     for (const v of results) {
       if (v.lat != null && v.lng != null) byId.set(v.id, v);
     }
@@ -213,7 +200,7 @@ async function main() {
   const npsVenues = await fetchNPS();
   console.log(`  Got ${npsVenues.length} NPS venues.`);
 
-  console.log("Fetching OSM venues (this takes a few minutes)...");
+  console.log("Fetching museums/galleries/monuments from Geoapify...");
   const osmVenues = await fetchAllOSM();
   console.log(`  Got ${osmVenues.length} OSM venues.`);
 
