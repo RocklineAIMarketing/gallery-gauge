@@ -16,21 +16,68 @@
 //   NPS_API_KEY               -- your existing NPS key, now used server-side only
 //   GEOAPIFY_API_KEY          -- free at https://myprojects.geoapify.com/
 //
+// Optional env vars:
+//   SYNC_MAX_RUN_MINUTES       -- safety cap per invocation (default 25)
+//   SYNC_FRESHNESS_HOURS       -- how long a cell is considered "already
+//                                 done" before it's fetched again (default 20,
+//                                 so a daily cron naturally re-covers
+//                                 everything for freshness, but re-running
+//                                 the same day after a timeout just resumes
+//                                 the cells that weren't finished yet)
+//
 // Run:
 //   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... NPS_API_KEY=... GEOAPIFY_API_KEY=... node sync-venues.mjs
+//
+// ---------------------------------------------------------------------
+// WHY THIS VERSION IS DIFFERENT FROM THE FIRST DRAFT
+// ---------------------------------------------------------------------
+// The original script split the continental US into a 5x8 grid -- 40 cells,
+// each roughly 345 x 350 miles. Each cell was fetched with a single
+// `limit=500` call and no pagination. That's fine for sparse rural cells,
+// but a cell that big can easily contain several major metro areas at once
+// (e.g. one cell covered Chicago *and* Detroit *and* Indianapolis *and*
+// Milwaukee). Geoapify doesn't sort results by relevance to any particular
+// city inside that rectangle, so whichever venues happened to come back
+// first in the 500-row cap could exhaust the limit before a given city's
+// venues were ever returned -- silently dropping them, with no error and
+// no warning. That's what was happening to Chicago: the sync "succeeded"
+// and logged a healthy total count, but Chicago-area rows never made it
+// into Supabase at all.
+//
+// Two changes fix this:
+//   1. A much finer grid (20 x 12 = 240 cells instead of 40), so a single
+//      cell is small enough that even a dense metro area is unlikely to
+//      blow through 500 results.
+//   2. Pagination within each cell as a safety net: if a cell's first page
+//      comes back completely full (exactly `limit` rows), that's a sign
+//      there may be more, so the script keeps paging with `offset` until a
+//      page comes back under the limit, up to a sane cap.
+//
+// Because 240 cells takes much longer than 40, this version is also
+// resumable: it records each completed cell (with a timestamp) in a small
+// `sync_progress` table in Supabase. If a run gets cut off by the time
+// budget, the next run skips cells that were completed recently and picks
+// up where it left off, instead of restarting from cell 1 every time.
+// Cells older than SYNC_FRESHNESS_HOURS are treated as needing a refresh,
+// so a daily/weekly cron naturally keeps recycling through the whole
+// country rather than syncing once and never updating stale entries.
 
 import { createClient } from "@supabase/supabase-js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const NPS_API_KEY = process.env.NPS_API_KEY;
+const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !NPS_API_KEY) {
-  console.error("Missing required env vars: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, NPS_API_KEY");
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !NPS_API_KEY || !GEOAPIFY_API_KEY) {
+  console.error("Missing required env vars: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, NPS_API_KEY, GEOAPIFY_API_KEY");
   process.exit(1);
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+const MAX_RUN_MS = (Number(process.env.SYNC_MAX_RUN_MINUTES) || 25) * 60 * 1000;
+const FRESHNESS_MS = (Number(process.env.SYNC_FRESHNESS_HOURS) || 20) * 60 * 60 * 1000;
 
 /* ---------------------------------------------------------------------
    NPS -- small dataset (~470 parks/monuments), one call covers all of it
@@ -59,33 +106,25 @@ async function fetchNPS() {
 
 /* ---------------------------------------------------------------------
    MUSEUMS/GALLERIES/MONUMENTS via Geoapify Places API
-   Geoapify wraps OSM data behind a real, paid-tier-grade API -- reliable
-   from CI/datacenter IPs, unlike the free public Overpass mirrors, which
-   either rate-limit hard or outright block shared GitHub Actions IPs.
-   Free tier: https://www.geoapify.com/pricing (generous daily quota).
 --------------------------------------------------------------------- */
-const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
-if (!GEOAPIFY_API_KEY) {
-  console.error("Missing required env var: GEOAPIFY_API_KEY");
-  process.exit(1);
-}
-
 const US_BOUNDS = { minLat: 24.5, maxLat: 49.5, minLng: -125, maxLng: -66.9 };
-const GRID_COLS = 8;
-const GRID_ROWS = 5;
-const PAUSE_MS = 1500;
-const MAX_RUN_MS = 8 * 60 * 1000; // safety cap -- should finish well under this
+const GRID_COLS = 20; // was 8 -- finer grid so a cell can't span several metros
+const GRID_ROWS = 12; // was 5
+const PAUSE_MS = 600; // shorter pause between requests -- 240 cells at 1500ms
+                       // would burn 6 minutes just pausing before any fetches
+const PAGE_LIMIT = 500;       // Geoapify's max per request
+const MAX_PAGES_PER_CELL = 4; // safety cap -- 4 x 500 = 2000 venues per cell,
+                               // far more than a well-sized cell should ever
+                               // legitimately have; hitting this cap is a
+                               // sign the grid needs to be even finer there
 
-// Verified against Geoapify's published category enum
-// (https://apidocs.geoapify.com/docs/places/#categories):
 const GEOAPIFY_CATEGORIES = [
   "entertainment.museum",
   "entertainment.culture.gallery",
   "entertainment.culture.arts_centre",
   "tourism.sights.memorial",
   "tourism.attraction.artwork",
-  "natural.protected_area", // closest match to "state park" -- OSM has no
-                            // dedicated state-park tag Geoapify exposes
+  "natural.protected_area",
 ].join(",");
 
 function buildGridCells() {
@@ -95,6 +134,7 @@ function buildGridCells() {
   for (let r = 0; r < GRID_ROWS; r++) {
     for (let c = 0; c < GRID_COLS; c++) {
       cells.push({
+        index: r * GRID_COLS + c,
         south: US_BOUNDS.minLat + r * latStep,
         north: US_BOUNDS.minLat + (r + 1) * latStep,
         west: US_BOUNDS.minLng + c * lngStep,
@@ -113,25 +153,23 @@ function categorizeGeoapify(categories) {
   if (cats.some(c => c.startsWith("tourism.sights.memorial.monument"))) return "Monument";
   if (cats.some(c => c.startsWith("tourism.sights.memorial"))) return "Memorial";
   if (cats.includes("natural.protected_area")) return "State park";
-  return "Museum"; // entertainment.museum, and sane default
+  return "Museum";
 }
 
-async function fetchGeoapifyCell(bbox) {
+async function fetchGeoapifyPage(bbox, offset) {
   const rect = `rect:${bbox.west},${bbox.south},${bbox.east},${bbox.north}`;
-  const url = `https://api.geoapify.com/v2/places?categories=${GEOAPIFY_CATEGORIES}&filter=${encodeURIComponent(rect)}&limit=500`;
+  const url = `https://api.geoapify.com/v2/places?categories=${GEOAPIFY_CATEGORIES}&filter=${encodeURIComponent(rect)}&limit=${PAGE_LIMIT}&offset=${offset}&apiKey=${GEOAPIFY_API_KEY}`;
 
-  const doFetch = () => fetch(url, { headers: { "x-api-key": GEOAPIFY_API_KEY } });
-
+  const doFetch = () => fetch(url);
   let res = await doFetch();
   if (res.status === 429) {
-    console.warn("  Geoapify rate-limited (429), waiting 5s then trying once more...");
+    console.warn("    rate-limited (429), waiting 5s then trying once more...");
     await new Promise(r => setTimeout(r, 5000));
     res = await doFetch();
   }
-
   if (!res.ok) {
     const body = await res.text();
-    console.warn(`  Geoapify request failed (${res.status}): ${body.slice(0, 200)}`);
+    console.warn(`    request failed (${res.status}): ${body.slice(0, 200)}`);
     return [];
   }
 
@@ -152,25 +190,90 @@ async function fetchGeoapifyCell(bbox) {
     }));
 }
 
+// Fetches one grid cell, paginating with `offset` if the cell looks like it
+// might have more than one page's worth of results. If a page comes back
+// completely full (== PAGE_LIMIT), that's a signal there could be more, so
+// we keep going. If a page comes back under the limit, we've seen everything
+// in that cell and stop.
+async function fetchGeoapifyCell(cell) {
+  const bbox = { south: cell.south, north: cell.north, west: cell.west, east: cell.east };
+  const results = [];
+  let offset = 0;
+  let page = 0;
+
+  while (page < MAX_PAGES_PER_CELL) {
+    const pageResults = await fetchGeoapifyPage(bbox, offset);
+    results.push(...pageResults);
+    page++;
+    if (pageResults.length < PAGE_LIMIT) break; // last page
+    offset += PAGE_LIMIT;
+    await new Promise(r => setTimeout(r, PAUSE_MS));
+  }
+
+  if (page === MAX_PAGES_PER_CELL) {
+    console.warn(`    cell ${cell.index} hit the ${MAX_PAGES_PER_CELL}-page safety cap -- this cell may still be too big, consider a finer grid`);
+  }
+
+  return results;
+}
+
+/* ---------------------------------------------------------------------
+   PROGRESS TRACKING -- lets a run resume instead of restarting at cell 0.
+   Table (create once in Supabase SQL editor):
+     create table if not exists sync_progress (
+       cell_index int primary key,
+       completed_at timestamptz not null
+     );
+--------------------------------------------------------------------- */
+async function loadFreshCellIndexes() {
+  const cutoff = new Date(Date.now() - FRESHNESS_MS).toISOString();
+  const { data, error } = await supabase
+    .from("sync_progress")
+    .select("cell_index")
+    .gte("completed_at", cutoff);
+
+  if (error) {
+    console.warn("Couldn't load sync_progress (does the table exist yet?) -- treating all cells as pending:", error.message);
+    return new Set();
+  }
+  return new Set((data || []).map(row => row.cell_index));
+}
+
+async function markCellComplete(cellIndex) {
+  const { error } = await supabase
+    .from("sync_progress")
+    .upsert({ cell_index: cellIndex, completed_at: new Date().toISOString() }, { onConflict: "cell_index" });
+  if (error) console.warn(`Couldn't record progress for cell ${cellIndex}:`, error.message);
+}
+
 async function fetchAllOSM() {
   const cells = buildGridCells();
+  const alreadyFresh = await loadFreshCellIndexes();
+  const pending = cells.filter(c => !alreadyFresh.has(c.index));
+
+  console.log(`  ${cells.length} total cells, ${alreadyFresh.size} still fresh from a recent run, ${pending.length} to fetch now.`);
+
   const byId = new Map(); // dedupe -- a venue near a cell boundary can appear twice
   const deadline = Date.now() + MAX_RUN_MS;
+  let stoppedEarly = false;
 
-  for (let i = 0; i < cells.length; i++) {
+  for (let i = 0; i < pending.length; i++) {
     if (Date.now() > deadline) {
-      console.warn(`  Time budget (${MAX_RUN_MS / 60000}min) reached -- stopping at cell ${i + 1}/${cells.length}. Next run will cover the rest.`);
+      console.warn(`  Time budget (${MAX_RUN_MS / 60000}min) reached -- stopping at ${i}/${pending.length} pending cells. Run again to continue -- already-completed cells will be skipped automatically.`);
+      stoppedEarly = true;
       break;
     }
-    console.log(`  Geoapify cell ${i + 1}/${cells.length}...`);
-    const results = await fetchGeoapifyCell(cells[i]);
+    const cell = pending[i];
+    console.log(`  Geoapify cell ${cell.index} (${i + 1}/${pending.length} pending)...`);
+    const results = await fetchGeoapifyCell(cell);
     for (const v of results) {
       if (v.lat != null && v.lng != null) byId.set(v.id, v);
     }
-    if (i < cells.length - 1) await new Promise(r => setTimeout(r, PAUSE_MS));
+    await markCellComplete(cell.index);
+    if (i < pending.length - 1) await new Promise(r => setTimeout(r, PAUSE_MS));
   }
 
-  return [...byId.values()];
+  return { venues: [...byId.values()], stoppedEarly };
 }
 
 /* ---------------------------------------------------------------------
@@ -201,16 +304,21 @@ async function main() {
   console.log(`  Got ${npsVenues.length} NPS venues.`);
 
   console.log("Fetching museums/galleries/monuments from Geoapify...");
-  const osmVenues = await fetchAllOSM();
-  console.log(`  Got ${osmVenues.length} OSM venues.`);
+  const { venues: osmVenues, stoppedEarly } = await fetchAllOSM();
+  console.log(`  Got ${osmVenues.length} OSM venues this run.`);
 
   const all = [...npsVenues, ...osmVenues];
   console.log(`Upserting ${all.length} venues into Supabase...`);
   const count = await upsertVenues(all);
   console.log(`Done. Upserted ${count} venues.`);
+
+  if (stoppedEarly) {
+    console.log("This run hit its time budget before covering every cell -- run the script again (or wait for the next scheduled run) to pick up the rest.");
+  }
 }
 
 main().catch(err => {
   console.error("Sync failed:", err);
   process.exit(1);
 });
+
