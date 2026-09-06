@@ -323,6 +323,18 @@ let currentUser = null;
 let currentProfile = null;
 let lastResults = []; // the merged venue list from the last search
 
+// Cache raw (unfiltered) NPS + OSM results per location, so retyping a
+// different search term for the same city re-filters instantly instead of
+// re-hitting both APIs. Cleared after 10 minutes so data doesn't go stale.
+const locationCache = new Map();
+const CACHE_TTL_MS = 10 * 60 * 1000;
+
+function cacheKeyFor(center) {
+  if (!center) return "nationwide";
+  // round to ~1km so tiny geocoding jitter still hits the cache
+  return `${center.lat.toFixed(2)},${center.lng.toFixed(2)}`;
+}
+
 /* ---------------------------------------------------------------------
    AUTH
 --------------------------------------------------------------------- */
@@ -406,6 +418,24 @@ async function geocodeLocation(query) {
 /* ---------------------------------------------------------------------
    VENUE SOURCES -- live calls, no database of our own
 --------------------------------------------------------------------- */
+// NPS is a small, fast dataset (~500 parks) so it's cheap to query fresh every
+// time with the current search term. Overpass is the slow one, so its raw,
+// unfiltered result for a location is what gets cached and reused.
+async function getVenueData(center, q) {
+  const key = cacheKeyFor(center);
+  const cached = locationCache.get(key);
+  const fresh = cached && (Date.now() - cached.timestamp < CACHE_TTL_MS);
+
+  const [npsResults, osmResults] = await Promise.all([
+    searchNPS(q),
+    fresh ? Promise.resolve(cached.osmResults) : searchOverpass(center),
+  ]);
+
+  if (!fresh) locationCache.set(key, { timestamp: Date.now(), osmResults });
+
+  return [npsResults, osmResults];
+}
+
 async function searchNPS(q) {
   const url = `https://developer.nps.gov/api/v1/parks?q=${encodeURIComponent(q || "")}&limit=50&api_key=${NPS_API_KEY}`;
   const res = await fetch(url);
@@ -426,23 +456,22 @@ async function searchNPS(q) {
     }));
 }
 
-async function searchOverpass(center, radiusMiles = 50) {
+async function searchOverpass(center, radiusMiles = 40) {
   if (!center) return [];
   const radiusMeters = Math.round(radiusMiles * 1609.34);
+  // Consolidated into fewer "around" clauses using regex alternation on shared
+  // keys -- each separate clause is a full spatial scan, so cutting 9 down to
+  // 4 is the biggest lever on speed without dropping any category.
   const query = `
-    [out:json][timeout:50];
+    [out:json][timeout:30];
     (
-      nwr["tourism"="museum"](around:${radiusMeters},${center.lat},${center.lng});
-      nwr["tourism"="gallery"](around:${radiusMeters},${center.lat},${center.lng});
-      nwr["tourism"="artwork"](around:${radiusMeters},${center.lat},${center.lng});
+      nwr["tourism"~"^(museum|gallery|artwork)$"](around:${radiusMeters},${center.lat},${center.lng});
+      nwr["historic"~"^(monument|memorial|archaeological_site)$"](around:${radiusMeters},${center.lat},${center.lng});
       nwr["amenity"="arts_centre"](around:${radiusMeters},${center.lat},${center.lng});
-      nwr["historic"="monument"](around:${radiusMeters},${center.lat},${center.lng});
-      nwr["historic"="memorial"](around:${radiusMeters},${center.lat},${center.lng});
-      nwr["historic"="archaeological_site"](around:${radiusMeters},${center.lat},${center.lng});
       nwr["leisure"="park"]["protection_title"~"State Park",i](around:${radiusMeters},${center.lat},${center.lng});
       nwr["boundary"="protected_area"]["protect_class"="24"](around:${radiusMeters},${center.lat},${center.lng});
     );
-    out center tags 200;
+    out center tags 150;
   `;
   const res = await fetch("https://overpass.kumi.systems/api/interpreter", {
     method: "POST",
@@ -549,10 +578,7 @@ async function runSearch({ q = "", location = "", limit = null, titleOverride = 
       setCookie(LOCATION_COOKIE, location, 365); // remember it for next visit
     }
 
-    const [npsResults, osmResults] = await Promise.all([
-      searchNPS(q),
-      searchOverpass(center),
-    ]);
+    const [npsResults, osmResults] = await getVenueData(center, q);
 
     let merged = [...npsResults, ...osmResults];
     if (q) {
