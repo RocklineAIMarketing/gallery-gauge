@@ -1,4 +1,4 @@
-// sync-venues.mjs
+sync-venues.mjs
 //
 // Populates the `venues` table from official U.S. government sources only:
 //   - NPS (National Park Service)         -- parks, monuments, historic sites
@@ -330,10 +330,14 @@ async function fetchSmithsonian() {
    available. Free, no API key. Query service:
    https://query.wikidata.org/sparql
 
-   Coverage note, honestly: this is "every museum someone has documented on
-   Wikidata," not "every museum in America." Well-known institutions will
-   have full data (photo, website, Wikipedia link); small/obscure ones may
-   only have a name and coordinates.
+   Coverage note, honestly: this now REQUIRES a photo (P18) to be present on
+   Wikidata, at your request -- entries without one are excluded entirely by
+   the query itself, not filtered afterward. That trades away a meaningful
+   chunk of coverage (plenty of real, legitimate small museums are
+   documented on Wikidata with no photo on file) in exchange for every
+   result being guaranteed to have a real image instead of a placeholder
+   card. If you ever want the fuller (photo-optional) set back, this is the
+   one line to revert: search this file for "must have a photo".
 
    Wikidata's usage policy requires a real, identifying User-Agent on
    requests to their query service -- anonymous-looking traffic gets
@@ -362,7 +366,7 @@ function wikidataQuery(afterQid) {
       ?item wdt:P625 ?coord.              # must have coordinates
       ${cursor}
       OPTIONAL { ?item wdt:P856 ?website. }
-      OPTIONAL { ?item wdt:P18 ?image. }
+      ?item wdt:P18 ?image.               # must have a photo -- see comment above
       OPTIONAL { ?item wdt:P131 ?admin. }
       OPTIONAL {
         ?article schema:about ?item ;
@@ -423,7 +427,7 @@ async function fetchWikidataPage(afterQid) {
         lat: point.lat,
         lng: point.lng,
         description,
-        photo_url: row.image?.value || null, // Commons Special:FilePath URLs work directly as image src
+        photo_url: row.image.value, // guaranteed present -- P18 is now a required triple, not optional
         source: "wikidata",
       };
     })
