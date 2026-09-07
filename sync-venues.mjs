@@ -1,5 +1,5 @@
-
 // sync-venues.mjs
+//
 // Populates the `venues` table from official U.S. government sources only:
 //   - NPS (National Park Service)         -- parks, monuments, historic sites
 //   - NRHP (National Register of Historic Places, via NPS's public
@@ -17,6 +17,13 @@
 //     so this part has to be maintained by hand). Any unit code Smithsonian
 //     reports that isn't in the lookup yet gets logged as a warning instead
 //     of silently dropped.
+//   - Wikidata -- every entity classified as a museum (Q33506 or a subclass)
+//     located in the US, with name, coordinates, website, Wikipedia link,
+//     and image where Wikidata has one. Coverage depends entirely on what's
+//     been documented on Wikidata -- comprehensive for well-known museums,
+//     thin for small/obscure ones. No API key needed, but Wikidata's usage
+//     policy requires a real identifying User-Agent -- see WIKIDATA_USER_AGENT
+//     further down in this file and fill in your actual contact info there.
 //
 // Run this once to seed the table, then on a schedule (cron / GitHub Action /
 // Supabase scheduled Edge Function) to keep it fresh.
@@ -41,6 +48,8 @@
 //
 // Optional env vars:
 //   SYNC_MAX_RUN_MINUTES  -- safety cap per invocation (default 25)
+//   SYNC_FRESHNESS_HOURS  -- how long a completed Wikidata sync cycle is
+//                            considered fresh before it's re-run (default 20)
 //
 // Run:
 //   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... NPS_API_KEY=... SMITHSONIAN_API_KEY=... node sync-venues.mjs
@@ -58,6 +67,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !NPS_API_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const MAX_RUN_MS = (Number(process.env.SYNC_MAX_RUN_MINUTES) || 25) * 60 * 1000;
+const FRESHNESS_MS = (Number(process.env.SYNC_FRESHNESS_HOURS) || 20) * 60 * 60 * 1000; // used by the Wikidata cycle check below
 const PAUSE_MS = 400;
 
 /* ---------------------------------------------------------------------
@@ -314,6 +324,177 @@ async function fetchSmithsonian() {
 }
 
 /* ---------------------------------------------------------------------
+   WIKIDATA -- every entity Wikidata classifies as a museum (Q33506, plus
+   its subclasses -- art museums, history museums, etc.) located in the US,
+   with name, coordinates, website, Wikipedia article, and image where
+   available. Free, no API key. Query service:
+   https://query.wikidata.org/sparql
+
+   Coverage note, honestly: this is "every museum someone has documented on
+   Wikidata," not "every museum in America." Well-known institutions will
+   have full data (photo, website, Wikipedia link); small/obscure ones may
+   only have a name and coordinates.
+
+   Wikidata's usage policy requires a real, identifying User-Agent on
+   requests to their query service -- anonymous-looking traffic gets
+   throttled or blocked. WIKIDATA_USER_AGENT below has a placeholder; put
+   your actual contact info in it (an email or a URL to this project) before
+   running this at any real frequency.
+
+   Pagination note: SPARQL's OFFSET gets slow/unreliable on large result
+   sets (the engine still has to walk past every skipped row). This uses
+   "keyset" pagination instead -- each page asks for entities with an ID
+   greater than the last one seen, which stays fast regardless of how deep
+   you page.
+--------------------------------------------------------------------- */
+const WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql";
+const WIKIDATA_USER_AGENT = "GalleryGauge/1.0 (contact: YOUR_EMAIL_OR_SITE_URL_HERE)"; // <-- fill this in
+const WIKIDATA_PAGE_SIZE = 500;
+const WIKIDATA_MAX_PAGES = 60; // safety cap -- 60 x 500 = 30,000, comfortably
+                                // above the likely count of US museums on Wikidata
+
+function wikidataQuery(afterQid) {
+  const cursor = afterQid ? `FILTER(?item > wd:${afterQid})` : "";
+  return `
+    SELECT ?item ?itemLabel ?coord ?website ?image ?article ?adminLabel WHERE {
+      ?item wdt:P31/wdt:P279* wd:Q33506.  # instance of (a subclass of) museum
+      ?item wdt:P17 wd:Q30.               # country: United States
+      ?item wdt:P625 ?coord.              # must have coordinates
+      ${cursor}
+      OPTIONAL { ?item wdt:P856 ?website. }
+      OPTIONAL { ?item wdt:P18 ?image. }
+      OPTIONAL { ?item wdt:P131 ?admin. }
+      OPTIONAL {
+        ?article schema:about ?item ;
+                 schema:isPartOf <https://en.wikipedia.org/> .
+      }
+      SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+    }
+    ORDER BY ?item
+    LIMIT ${WIKIDATA_PAGE_SIZE}
+  `;
+}
+
+function parseWikidataPoint(wkt) {
+  // Wikidata coordinates come back as WKT: "Point(lng lat)"
+  const m = /Point\(([-\d.]+)\s+([-\d.]+)\)/.exec(wkt || "");
+  if (!m) return null;
+  return { lng: parseFloat(m[1]), lat: parseFloat(m[2]) };
+}
+
+async function fetchWikidataPage(afterQid) {
+  const url = `${WIKIDATA_ENDPOINT}?format=json&query=${encodeURIComponent(wikidataQuery(afterQid))}`;
+  const doFetch = () => fetch(url, {
+    headers: { "User-Agent": WIKIDATA_USER_AGENT, accept: "application/sparql-results+json" },
+  });
+
+  let res = await doFetch();
+  if (res.status === 429) {
+    console.warn("    Wikidata rate-limited (429), waiting 5s and retrying once...");
+    await new Promise(r => setTimeout(r, 5000));
+    res = await doFetch();
+  }
+  if (!res.ok) {
+    console.warn(`    Wikidata request failed (${res.status}) -- this page will be retried on the next run.`);
+    return null; // distinct from an empty-but-successful page
+  }
+
+  const json = await res.json();
+  const rows = json.results?.bindings || [];
+
+  const venues = rows
+    .map(row => {
+      const qid = row.item?.value?.split("/").pop();
+      const point = parseWikidataPoint(row.coord?.value);
+      if (!qid || !point) return null;
+
+      const websiteText = row.website?.value ? `Website: ${row.website.value}` : null;
+      const articleText = row.article?.value ? `Wikipedia: ${row.article.value}` : null;
+      const description = [websiteText, articleText].filter(Boolean).join(" | ") || null;
+
+      return {
+        id: `wikidata:${qid}`,
+        qid, // kept off the record before insert -- used only for the cursor below
+        name: row.itemLabel?.value || null,
+        category: "Museum",
+        city: row.adminLabel?.value || null,
+        state: null, // Wikidata's admin-region chain doesn't reliably resolve
+                     // to "state" in one hop -- left out rather than guessed
+        lat: point.lat,
+        lng: point.lng,
+        description,
+        photo_url: row.image?.value || null, // Commons Special:FilePath URLs work directly as image src
+        source: "wikidata",
+      };
+    })
+    .filter(v => v && v.name);
+
+  return venues;
+}
+
+// Resumable via a single-row cursor table (not per-page like NRHP, since
+// keyset pagination doesn't have fixed page numbers). If a run gets cut off
+// mid-cycle, the next run resumes from the last QID seen. Once a full cycle
+// completes (a page comes back under WIKIDATA_PAGE_SIZE), the cursor resets
+// so the next scheduled run starts a fresh pass and can pick up new/updated
+// entries -- gated by the same freshness window as everything else.
+async function loadWikidataProgress() {
+  const { data, error } = await supabase.from("wikidata_progress").select("*").eq("id", 1).maybeSingle();
+  if (error) {
+    console.warn("Couldn't load wikidata_progress (does the table exist yet?) -- starting from scratch:", error.message);
+    return { last_qid: null, cycle_completed_at: null };
+  }
+  return data || { last_qid: null, cycle_completed_at: null };
+}
+
+async function saveWikidataProgress(lastQid, cycleCompletedAt) {
+  const { error } = await supabase
+    .from("wikidata_progress")
+    .upsert({ id: 1, last_qid: lastQid, cycle_completed_at: cycleCompletedAt }, { onConflict: "id" });
+  if (error) console.warn("Couldn't save wikidata_progress:", error.message);
+}
+
+async function fetchAllWikidata() {
+  const progress = await loadWikidataProgress();
+  const cutoff = Date.now() - FRESHNESS_MS;
+  if (progress.cycle_completed_at && new Date(progress.cycle_completed_at).getTime() > cutoff) {
+    console.log("  Wikidata was fully synced recently -- skipping this run to stay within freshness window.");
+    return { venues: [], stoppedEarly: false };
+  }
+
+  let afterQid = progress.cycle_completed_at ? null : progress.last_qid; // fresh cycle starts null
+  const deadline = Date.now() + MAX_RUN_MS;
+  const all = [];
+  let stoppedEarly = false;
+
+  for (let page = 0; page < WIKIDATA_MAX_PAGES; page++) {
+    if (Date.now() > deadline) {
+      console.warn(`  Time budget reached -- stopping Wikidata after ${page} pages this run. Run again to continue from the same cursor.`);
+      stoppedEarly = true;
+      break;
+    }
+
+    console.log(`  Wikidata page ${page} (after ${afterQid || "start"})...`);
+    const pageVenues = await fetchWikidataPage(afterQid);
+    if (pageVenues === null) { stoppedEarly = true; break; } // request failed -- resume here next time
+
+    all.push(...pageVenues);
+
+    if (pageVenues.length < WIKIDATA_PAGE_SIZE) {
+      console.log(`  Reached the end of Wikidata's US museum results at page ${page}.`);
+      await saveWikidataProgress(null, new Date().toISOString()); // cycle complete, reset cursor
+      break;
+    }
+
+    afterQid = pageVenues[pageVenues.length - 1].qid;
+    await saveWikidataProgress(afterQid, progress.cycle_completed_at || null);
+    await new Promise(r => setTimeout(r, PAUSE_MS));
+  }
+
+  return { venues: all.map(({ qid, ...v }) => v), stoppedEarly }; // strip the helper `qid` field before upsert
+}
+
+/* ---------------------------------------------------------------------
    UPSERT -- batched so we don't send one giant request
 --------------------------------------------------------------------- */
 async function upsertVenues(venues) {
@@ -341,20 +522,25 @@ async function main() {
   console.log(`  Got ${npsVenues.length} NPS venues.`);
 
   console.log("Fetching National Register of Historic Places listings...");
-  const { venues: nrhpVenues, stoppedEarly } = await fetchAllNrhp();
+  const { venues: nrhpVenues, stoppedEarly: nrhpStoppedEarly } = await fetchAllNrhp();
   console.log(`  Got ${nrhpVenues.length} NRHP venues this run.`);
 
   console.log("Fetching Smithsonian's live museum unit roster...");
   const smithsonianVenues = await fetchSmithsonian();
   console.log(`  Got ${smithsonianVenues.length} Smithsonian venues.`);
 
-  const all = [...npsVenues, ...nrhpVenues, ...smithsonianVenues];
+  console.log("Fetching museums from Wikidata...");
+  const { venues: wikidataVenues, stoppedEarly: wikidataStoppedEarly } = await fetchAllWikidata();
+  console.log(`  Got ${wikidataVenues.length} Wikidata venues this run.`);
+
+  const stoppedEarly = nrhpStoppedEarly || wikidataStoppedEarly;
+  const all = [...npsVenues, ...nrhpVenues, ...smithsonianVenues, ...wikidataVenues];
   console.log(`Upserting ${all.length} venues into Supabase...`);
   const count = await upsertVenues(all);
   console.log(`Done. Upserted ${count} venues.`);
 
   if (stoppedEarly) {
-    console.log("This run hit its time budget before covering every NRHP page -- run the script again (or wait for the next scheduled run) to pick up the rest.");
+    console.log("This run hit its time budget before finishing NRHP and/or Wikidata -- run the script again (or wait for the next scheduled run) to pick up the rest.");
   }
 }
 
