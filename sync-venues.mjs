@@ -188,7 +188,13 @@ async function markNrhpPageComplete(page) {
 async function fetchAllNrhp() {
   const completed = await loadCompletedNrhpPages();
   const deadline = Date.now() + MAX_RUN_MS;
-  const all = [];
+  // A Map instead of a plain array -- NRHP districts are nominated as one
+  // submission covering many contributing buildings, and each contributing
+  // building can come back as its own point but sharing the district's
+  // NRIS_Refnum. That produces duplicate `id`s, which made a single upsert
+  // batch try to update the same row twice ("ON CONFLICT DO UPDATE command
+  // cannot affect row a second time"). Deduping by id here fixes it.
+  const byId = new Map();
   let stoppedEarly = false;
 
   for (let page = 0; page < NRHP_MAX_PAGES; page++) {
@@ -203,7 +209,7 @@ async function fetchAllNrhp() {
     const offset = page * NRHP_PAGE_SIZE;
     console.log(`  NRHP page ${page} (offset ${offset})...`);
     const records = await fetchNrhpPage(offset);
-    all.push(...records);
+    for (const r of records) byId.set(r.id, r);
     await markNrhpPageComplete(page);
 
     if (records.length < NRHP_PAGE_SIZE) {
@@ -213,7 +219,7 @@ async function fetchAllNrhp() {
     await new Promise(r => setTimeout(r, PAUSE_MS));
   }
 
-  return { venues: all, stoppedEarly };
+  return { venues: [...byId.values()], stoppedEarly };
 }
 
 /* ---------------------------------------------------------------------
